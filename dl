@@ -1,0 +1,959 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+DLMUX (ytdlmux) — modern yt-dlp TUI downloader for Termux / Android.
+
+Usage:
+    dl <url> [<url> ...]        pick resolution, save to DCIM/ytdlmux (gallery)
+    dl -a <url>                 audio only (MP3 320k)
+    dl -y <url>                 skip picker, best quality
+    dl -l <url>                 list available formats
+    dl -f "137+140" <url>       explicit yt-dlp format selector
+    dl -p <url>                 download whole playlist
+    dl                          URL taken from Android clipboard
+
+Downloads are written to /storage/emulated/0/DCIM/ytdlmux and then handed to
+Android's media scanner, so finished files show up in the phone's Gallery app.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+# --------------------------------------------------------------------------- #
+#  paths / helpers
+# --------------------------------------------------------------------------- #
+
+# Android's gallery lives under DCIM. Everything we download goes into
+# DCIM/ytdlmux so the phone's Gallery app picks it up automatically.
+GALLERY_SUBDIR = "ytdlmux"
+
+DOWNLOAD_DIRS = [
+    Path("/storage/emulated/0/DCIM") / GALLERY_SUBDIR,   # Android DCIM (gallery)
+    Path("/sdcard/DCIM") / GALLERY_SUBDIR,
+    Path.home() / "storage" / "dcim" / GALLERY_SUBDIR,   # Termux symlink fallback
+    Path.home() / "storage" / "downloads",               # last resort
+    Path.home() / "Downloads",
+]
+
+
+def is_gallery_dir(path) -> bool:
+    """True if `path` is (inside) the DCIM/ytdlmux gallery folder."""
+    try:
+        p = Path(path).resolve()
+    except OSError:
+        return False
+    for base in DOWNLOAD_DIRS[:3]:
+        try:
+            b = base.resolve()
+        except OSError:
+            continue
+        if p == b or b in p.parents:
+            return True
+    return False
+
+
+def find_download_dir() -> Path:
+    """First writable destination, preferring the DCIM gallery folder."""
+    for cand in DOWNLOAD_DIRS:
+        try:
+            if cand.is_dir() and os.access(cand, os.W_OK):
+                return cand
+        except OSError:
+            continue
+    # DCIM exists but our subfolder does not yet -> create it there.
+    for cand in DOWNLOAD_DIRS[:3]:
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            if os.access(cand, os.W_OK):
+                return cand
+        except OSError:
+            continue
+    return Path.home()
+
+
+def fmt_bytes(n) -> str:
+    if not n:
+        return "?"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return "?"
+
+
+def fmt_dur(sec) -> str:
+    try:
+        sec = int(float(sec))
+    except (TypeError, ValueError):
+        return "?"
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def fmt_eta(sec) -> str:
+    try:
+        sec = int(float(sec))
+    except (TypeError, ValueError):
+        return "--:--"
+    if sec < 0:
+        return "--:--"
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def fmt_views(v) -> str:
+    if not v:
+        return ""
+    for unit, div in (("B", 10 ** 9), ("M", 10 ** 6), ("K", 10 ** 3)):
+        if v >= div:
+            return f"{v / div:.1f}{unit} views"
+    return f"{v} views"
+
+
+def human_int(v) -> str:
+    return f"{v:,}".replace(",", ".")
+
+
+# --------------------------------------------------------------------------- #
+#  rich imports (with friendly failure)
+# --------------------------------------------------------------------------- #
+
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich import box
+    from rich.progress import (
+        BarColumn,
+        DownloadColumn,
+        Progress,
+        ProgressColumn,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+except ImportError:  # pragma: no cover
+    sys.stderr.write(
+        "\n[!] 'rich' belum terinstall.\n"
+        "    Jalankan:  pip install rich prompt_toolkit\n\n"
+    )
+    sys.exit(1)
+
+console = Console(highlight=False, soft_wrap=False)
+
+ACCENT = "cyan"
+OK = "green"
+WARN = "yellow"
+BAD = "red"
+DIM = "grey62"
+
+
+# --------------------------------------------------------------------------- #
+#  custom progress columns (use yt-dlp's own speed / eta numbers)
+# --------------------------------------------------------------------------- #
+
+class SpeedColumn(ProgressColumn):
+    """Download speed reported by yt-dlp."""
+
+    def render(self, task) -> Text:
+        if task.fields.get("_overall"):
+            return Text("")
+        speed = task.fields.get("speed")
+        if not speed:
+            return Text("  -- B/s", style=DIM)
+        return Text(f"{fmt_bytes(speed)}/s", style=f"bold {WARN}")
+
+
+class EtaColumn(ProgressColumn):
+    """Time left reported by yt-dlp."""
+
+    def render(self, task) -> Text:
+        if task.fields.get("_overall"):
+            return Text("")
+        eta = task.fields.get("eta")
+        if eta is None:
+            return Text("--:--", style=DIM)
+        return Text(fmt_eta(eta), style=f"bold {ACCENT}")
+
+
+# --------------------------------------------------------------------------- #
+#  format picker
+# --------------------------------------------------------------------------- #
+
+AUDIO_CHOICE = {"kind": "audio_mp3"}
+
+
+def js_runtimes():
+    """Pick an available JS runtime so YouTube extraction stays supported."""
+    for rt in ("node", "deno", "bun", "qjs"):
+        if shutil.which(rt):
+            return {rt: {}}
+    return None
+
+
+def _extract(url: str, playlist: bool, cookies_from_browser=None):
+    """Fetch metadata without downloading."""
+    from yt_dlp import YoutubeDL
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "skip_download": True,
+        "noplaylist": not playlist,
+        "extract_flat": False,
+        "socket_timeout": 20,
+        "retries": 3,
+        "ignoreerrors": False,
+    }
+    rt = js_runtimes()
+    if rt:
+        opts["js_runtimes"] = rt
+    with YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def _entry(info):
+    """First real video entry of a playlist, if any."""
+    if info.get("_type") == "playlist":
+        for e in info.get("entries") or []:
+            if e:
+                return e
+        raise RuntimeError("playlist kosong")
+    return info
+
+
+def _est_size(fmt, duration) -> int:
+    size = fmt.get("filesize") or fmt.get("filesize_approx")
+    if size:
+        return int(size)
+    tbr = fmt.get("tbr")
+    if tbr and duration:
+        return int(tbr * 1000 / 8 * duration)
+    return 0
+
+
+def build_choices(info):
+    """Group formats by height -> list of picker entries."""
+    formats = info.get("formats") or []
+    duration = info.get("duration")
+    video = [f for f in formats if f.get("vcodec") not in (None, "none")]
+    audio = [f for f in formats if f.get("acodec") not in (None, "none")
+             and f.get("vcodec") in (None, "none")]
+
+    best_audio = None
+    for a in audio:
+        score = (a.get("abr") or 0, _est_size(a, duration))
+        if best_audio is None or score > best_audio[0]:
+            best_audio = (score, a)
+    best_audio_fmt = best_audio[1] if best_audio else None
+    audio_size = _est_size(best_audio_fmt, duration) if best_audio_fmt else 0
+
+    # best video per height
+    per_height = {}
+    for f in video:
+        h = f.get("height")
+        if not h:
+            continue
+        key = h
+        score = (
+            f.get("fps") or 0,
+            f.get("vcodec", "").startswith("avc1"),   # prefer H.264 (Android-friendly)
+            f.get("tbr") or 0,
+            _est_size(f, duration),
+        )
+        if key not in per_height or score > per_height[key][0]:
+            per_height[key] = (score, f)
+
+    choices = []
+    # 1) best auto
+    choices.append((
+        "[ BEST ]  Kualitas terbaik (auto)   — video+audio terbaik yang tersedia",
+        {"kind": "auto"},
+    ))
+
+    # 2) per resolution, highest first
+    for h in sorted(per_height, reverse=True):
+        f = per_height[h][1]
+        fps = f.get("fps")
+        ext = f.get("ext") or "?"
+        total = _est_size(f, duration) + audio_size
+        note = f.get("format_note") or ""
+        label = f"{h}p"
+        if fps and fps >= 50:
+            label += f"{int(fps)}"
+        extra = f" · {note}" if note and note not in label else ""
+        size = f"  ~{fmt_bytes(total)}" if total else "  (ukuran ?)"
+        star = "  ⭐" if h >= 1080 else ""
+        choices.append((
+            f"[ {label:<7} ]  {ext:<4} video+audio{size}{extra}{star}",
+            {"kind": "video", "format_id": f.get("format_id"), "height": h,
+             "label": label, "ext": ext},
+        ))
+
+    # 3) audio options
+    choices.append((
+        "[ AUDIO ]  MP3 320 kbps (konversi ffmpeg)",
+        AUDIO_CHOICE,
+    ))
+    choices.append((
+        "[ AUDIO ]  M4A asli (tanpa konversi, lebih cepat)",
+        {"kind": "audio_m4a"},
+    ))
+    return choices
+
+
+def pick_with_prompt_toolkit(choices, title, subtitle):
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.shortcuts import radiolist_dialog
+    from prompt_toolkit.styles import Style
+
+    style = Style.from_dict({
+        "dialog": "bg:#0f172a",
+        "dialog frame.label": "bg:#0f172a #22d3ee bold",
+        "dialog.body": "bg:#0f172a #e2e8f0",
+        "dialog shadow": "bg:#020617",
+        "radio-selected": "bg:#1e293b #22d3ee bold",
+        "radio-checked": "#22d3ee bold",
+        "radio": "#e2e8f0",
+        "button": "bg:#334155 #e2e8f0",
+        "button.focused": "bg:#22d3ee #0f172a bold",
+    })
+
+    result = radiolist_dialog(
+        title=title,
+        text=HTML(
+            f"<b>{subtitle}</b>\n"
+            "<ansigray>↑/↓ pilih · Enter download · Ctrl-C batal</ansigray>"
+        ),
+        values=[(i, label) for i, (label, _) in enumerate(choices)],
+        style=style,
+    ).run()
+    return None if result is None else choices[result][1]
+
+
+def pick_fallback(choices, title, subtitle):
+    """Plain numbered menu when prompt_toolkit is unavailable."""
+    console.print()
+    console.print(Panel.fit(
+        Text(subtitle, style="bold"), title=title, border_style=ACCENT))
+    for i, (label, _) in enumerate(choices, 1):
+        console.print(f"  [bold {ACCENT}]{i:>2}[/]  {label}")
+    console.print()
+    while True:
+        raw = console.input(f"[bold {ACCENT}]Pilih nomor[/] (Enter=1, q=batal): ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        if raw == "":
+            return choices[0][1]
+        if raw.isdigit() and 1 <= int(raw) <= len(choices):
+            return choices[int(raw) - 1][1]
+        console.print(f"[{BAD}]Nomor tidak valid.[/]")
+
+
+def choose_format(url, args, outdir):
+    """Return (label, format_selector, postprocessors, kind) or None if cancelled."""
+    if args.audio:
+        return ("MP3 320 kbps", "bestaudio/best", _audio_pp(), "audio")
+    if args.format:
+        return (args.format, args.format, None, "custom")
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if args.yes or not interactive:
+        return ("Best available", _best_selector(), None, "auto")
+
+    with console.status(f"[{ACCENT}]Mengambil daftar format…[/]", spinner="dots"):
+        try:
+            info = _entry(_extract(url, args.playlist))
+        except Exception as exc:                                  # noqa: BLE001
+            console.print(Panel(Text(str(exc), style=BAD),
+                                title="[bold red]Gagal mengambil info[/]",
+                                border_style=BAD))
+            return None
+
+    title = info.get("title") or url
+    uploader = info.get("uploader") or info.get("channel") or "?"
+    dur = info.get("duration")
+    views = info.get("view_count")
+
+    sub = f"{title}\n"
+    sub += f"{uploader}"
+    if dur:
+        sub += f"  ·  {fmt_dur(dur)}"
+    if views:
+        sub += f"  ·  {fmt_views(views)}"
+
+    choices = build_choices(info)
+    try:
+        picked = pick_with_prompt_toolkit(choices, " dl — pilih kualitas ", sub)
+    except Exception:                                             # noqa: BLE001
+        picked = pick_fallback(choices, "dl — pilih kualitas", sub)
+
+    if picked is None:
+        return None
+
+    kind = picked["kind"]
+    return choice_to_plan(picked)
+
+
+def choice_to_plan(picked):
+    """Map a picker entry to (label, yt-dlp format selector, postprocessors, kind)."""
+    kind = picked.get("kind")
+    if kind == "auto":
+        return ("Best available", _best_selector(), None, "auto")
+    if kind == "video":
+        fid = picked.get("format_id")
+        if not fid:
+            return ("Best available", _best_selector(), None, "auto")
+        sel = f"{fid}+bestaudio/{fid}+best/{fid}/best"
+        return (f"{picked.get('label', fid)} {picked.get('ext', '')}".strip(),
+                sel, None, "video")
+    if kind == "audio_m4a":
+        return ("M4A (asli)", "bestaudio[ext=m4a]/bestaudio/best", None, "audio")
+    if kind == "audio_mp3":
+        return ("MP3 320 kbps", "bestaudio/best", _audio_pp(), "audio")
+    return ("Best available", _best_selector(), None, "auto")
+
+
+def _best_selector() -> str:
+    # prefer mp4/m4a for maximum Android player compatibility, fall back to anything
+    return "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/best"
+
+
+def _audio_pp():
+    return [
+        {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"},
+        {"key": "FFmpegMetadata"},
+    ]
+
+
+# --------------------------------------------------------------------------- #
+#  yt-dlp logger -> rich
+# --------------------------------------------------------------------------- #
+
+class RichLogger:
+    def __init__(self):
+        self.warnings: list[str] = []
+        self.errors: list[str] = []
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        self.warnings.append(str(msg))
+
+    def error(self, msg):
+        self.errors.append(str(msg))
+
+
+# --------------------------------------------------------------------------- #
+#  downloader with live TUI
+# --------------------------------------------------------------------------- #
+
+class Downloader:
+    def __init__(self, outdir: Path, args):
+        self.outdir = outdir
+        self.args = args
+        self.tasks: dict[str, int] = {}          # key -> rich task id
+        self.totals: dict[str, int | None] = {}  # key -> total bytes
+        self.done: dict[str, int] = {}           # key -> downloaded bytes
+        self.last_speed: dict[str, float] = {}   # key -> last non-null speed
+        self.finished_files: list[str] = []      # final outputs (post-processed)
+        self.fragments: list[str] = []           # raw stream fragments
+        self.current_label = ""
+        self.overall_id = None
+        self.lock = threading.Lock()
+        self.progress = self._make_progress()
+
+    def _make_progress(self) -> Progress:
+        return Progress(
+            SpinnerColumn(style=ACCENT),
+            TextColumn("[bold]{task.description}", table_column=None),
+            BarColumn(bar_width=None, complete_style=ACCENT,
+                      finished_style=OK, pulse_style=ACCENT),
+            DownloadColumn(),
+            SpeedColumn(),
+            EtaColumn(),
+            TimeElapsedColumn(),
+            expand=True,
+            transient=False,
+            auto_refresh=False,
+        )
+
+    # ---------------- rendering ---------------- #
+
+    def header(self) -> Panel:
+        t = Text()
+        t.append("  ⬇  dl  ", style=f"bold white on {ACCENT}")
+        t.append("   yt-dlp TUI downloader\n", style=f"bold {ACCENT}")
+        t.append("  Tujuan   ", style=DIM)
+        t.append(f"{self.outdir}\n", style="bold white")
+        t.append("  Format   ", style=DIM)
+        t.append(f"{self.current_label or '-'}\n", style=f"bold {OK}")
+        t.append("  Selesai  ", style=DIM)
+        t.append(f"{len(self.finished_files)} file", style="bold white")
+        return Panel(t, border_style=ACCENT, box=box.ROUNDED, padding=(0, 1))
+
+    def render(self):
+        return Group(self.header(), self.progress.get_renderable())
+
+    # ---------------- progress plumbing ---------------- #
+
+    def _key(self, d) -> tuple[str, str]:
+        info = d.get("info_dict") or {}
+        key = f"{info.get('id', '?')}:{info.get('format_id', '?')}"
+        # human label: resolution for video, bitrate for audio
+        res = info.get("resolution")
+        height = info.get("height")
+        if res and res != "audio only":
+            label = res
+        elif height:
+            label = f"{height}p"
+        else:
+            abr = info.get("abr")
+            label = f"audio {int(abr)}k" if abr else "audio"
+        fps = info.get("fps")
+        if fps and fps >= 50 and height:
+            label = f"{height}p{int(fps)}"
+        vcodec = info.get("vcodec") or ""
+        acodec = info.get("acodec") or ""
+        kind = "🎬" if vcodec not in ("", "none") else "🎵"
+        return key, f"{kind} {label}"
+
+    def _overall_totals(self):
+        known = [t for t in self.totals.values() if t]
+        total = sum(known) if known and len(known) == len(self.totals) else None
+        return sum(self.done.values()), total
+
+    def hook(self, d):
+        with self.lock:
+            status = d.get("status")
+            key, note = self._key(d)
+
+            if status == "downloading":
+                if key not in self.tasks:
+                    self.tasks[key] = self.progress.add_task(
+                        f"{note}", total=None, speed=None, eta=None)
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                self.totals[key] = total
+                self.done[key] = d.get("downloaded_bytes") or 0
+                speed = d.get("speed")
+                if speed:
+                    self.last_speed[key] = speed
+                self.progress.update(
+                    self.tasks[key],
+                    total=total,
+                    completed=self.done[key],
+                    speed=speed or self.last_speed.get(key),
+                    eta=d.get("eta"),
+                    refresh=False,
+                )
+            elif status == "finished":
+                if key in self.tasks:
+                    total = self.totals.get(key) or d.get("total_bytes") or self.done.get(key)
+                    self.done[key] = total or self.done.get(key, 0)
+                    self.progress.update(
+                        self.tasks[key], total=total, completed=total,
+                        speed=self.last_speed.get(key), eta=0, refresh=False)
+                fname = d.get("filename")
+                if fname:
+                    self.fragments.append(fname)
+
+            done, total = self._overall_totals()
+            if self.overall_id is not None:
+                self.progress.update(self.overall_id, completed=done, total=total,
+                                     refresh=False)
+
+    def pp_hook(self, d):
+        with self.lock:
+            status = d.get("status")
+            name = d.get("postprocessor") or "post-process"
+            if status == "started":
+                if self.overall_id is not None:
+                    self.progress.update(self.overall_id,
+                                         description=f"⚙ {name}…", refresh=False)
+            elif status == "finished":
+                # Merger / MoveFiles / FFmpegExtractAudio produce the final file
+                if name in ("Merger", "MoveFiles", "FFmpegExtractAudio",
+                            "Metadata", "EmbedSubtitle", "FFmpegVideoRemuxer",
+                            "FFmpegVideoConvertor"):
+                    info = d.get("info_dict") or {}
+                    path = (d.get("filepath") or info.get("filepath")
+                            or info.get("_filename") or info.get("filename"))
+                    if path and path not in self.finished_files:
+                        self.finished_files.append(path)
+
+    # ---------------- the actual run ---------------- #
+
+    def download(self, url, selector, postprocessors) -> bool:
+        from yt_dlp import YoutubeDL
+
+        logger = RichLogger()
+        outtmpl = str(self.outdir / "%(title)s.%(ext)s")
+
+        opts = {
+            "format": selector,
+            "outtmpl": outtmpl,
+            "merge_output_format": "mp4",
+            "noplaylist": not self.args.playlist,
+            "playlist_items": self.args.playlist_items,
+            "ignoreerrors": bool(self.args.playlist),
+            "continuedl": True,
+            "overwrites": False,
+            "retries": 10,
+            "fragment_retries": 10,
+            "socket_timeout": 30,
+            "concurrent_fragment_downloads": 4,
+            "noprogress": True,
+            "quiet": True,
+            "no_warnings": False,
+            "logger": logger,
+            "progress_hooks": [self.hook],
+            "postprocessor_hooks": [self.pp_hook],
+            "consoletitle": False,
+            "trim_file_name": 200,
+            "windowsfilenames": False,
+        }
+        rt = js_runtimes()
+        if rt:
+            opts["js_runtimes"] = rt
+        if postprocessors:
+            opts["postprocessors"] = postprocessors
+        if self.args.sub:
+            opts.update({
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": ["id", "en"],
+                "subtitlesformat": "srt/best",
+                "embedsubtitles": True,
+            })
+        if self.args.proxy:
+            opts["proxy"] = self.args.proxy
+        if self.args.limit_rate:
+            opts["ratelimit"] = self.args.limit_rate
+
+        self.progress = self._make_progress()
+        self.tasks, self.totals, self.done, self.last_speed = {}, {}, {}, {}
+        self.overall_id = self.progress.add_task("TOTAL", total=None, _overall=True)
+
+        ok = True
+        started = time.time()
+        # NOTE: Live must receive a *callable* (get_renderable), not a snapshot.
+        # Passing self.render() here would freeze the display on the first frame
+        # while the download raced to completion (bar stuck, file already there).
+        with Live(console=console, get_renderable=self.render,
+                  refresh_per_second=10, transient=False,
+                  vertical_overflow="visible") as live:
+            try:
+                with YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+            except KeyboardInterrupt:
+                console.print(f"\n[{WARN}]Dibatalkan oleh user.[/]")
+                ok = False
+            except Exception as exc:                              # noqa: BLE001
+                console.print(Panel(Text(str(exc), style=BAD),
+                                    title="[bold red]Download gagal[/]",
+                                    border_style=BAD))
+                ok = False
+            finally:
+                self.progress.update(self.overall_id, description="SELESAI",
+                                     refresh=False)
+
+        console.print()
+
+        # Recoverable extraction warnings are noisy and yt-dlp usually retries
+        # them successfully — only surface diagnostics when something failed.
+        if not ok:
+            for w in logger.warnings[:3]:
+                console.print(f"[{WARN}]⚠ {w}[/]")
+            for e in logger.errors[:5]:
+                console.print(f"[{BAD}]✖ {e}[/]")
+
+        if ok:
+            elapsed = time.time() - started
+            files = [f for f in self.finished_files if f]
+            if not files:
+                # single-format download: no merger ran, use the raw file
+                files = [f for f in self.fragments if f]
+            # Register the finished files with Android so the Gallery app
+            # indexes them (runs in the background; never blocks the TUI).
+            existing = [f for f in files if Path(f).exists()]
+            in_gallery = is_gallery_dir(self.outdir)
+            if in_gallery:
+                media_scan(existing)
+            body = Text()
+            body.append("✔  Download selesai\n", style=f"bold {OK}")
+            body.append(f"   {len(files) or 1} file · {fmt_dur(elapsed)}\n", style=DIM)
+            for f in files[-6:]:
+                body.append(f"   {Path(f).name}\n", style="white")
+            body.append(f"   → {self.outdir}\n", style=f"bold {ACCENT}")
+            if in_gallery:
+                body.append("   📱 muncul di galeri HP", style=DIM)
+            console.print(Panel(body, border_style=OK, box=box.ROUNDED))
+        return ok
+
+
+# --------------------------------------------------------------------------- #
+#  termux integration
+# --------------------------------------------------------------------------- #
+
+def termux(cmd: list[str], timeout: int = 6):
+    if not shutil.which(cmd[0]):
+        return None
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, check=False).stdout
+    except Exception:                                             # noqa: BLE001
+        return None
+
+
+def clipboard_url() -> str | None:
+    if not termux_api_available():
+        return None
+    out = termux(["termux-clipboard-get"])
+    if not out:
+        return None
+    for token in out.split():
+        if token.startswith("http://") or token.startswith("https://"):
+            return token.strip()
+    return None
+
+
+def notify(title: str, content: str):
+    if not termux_api_available() or not shutil.which("termux-notification"):
+        return
+    threading.Thread(
+        target=lambda: termux(
+            ["termux-notification", "--title", title, "--content", content,
+             "--priority", "low"], timeout=6),
+        daemon=True,
+    ).start()
+
+
+def wake_lock(on: bool):
+    """Keep the CPU awake during a download (no-op without Termux:API)."""
+    if not termux_api_available():
+        return
+    termux(["termux-wake-lock"] if on else ["termux-wake-unlock"])
+
+
+# --------------------------------------------------------------------------- #
+#  media scanner — make finished files visible in the Android Gallery
+# --------------------------------------------------------------------------- #
+
+_TERMUX_API_OK: bool | None = None
+
+
+def termux_api_available() -> bool:
+    """Is the Termux:API app installed?
+
+    Without it, every termux-api command (termux-media-scan, termux-toast, ...)
+    blocks forever waiting for a reply that never comes. We therefore probe the
+    package list first — that check returns in well under a second.
+    """
+    global _TERMUX_API_OK
+    if _TERMUX_API_OK is not None:
+        return _TERMUX_API_OK
+    _TERMUX_API_OK = False
+    if shutil.which("pm"):
+        try:
+            out = subprocess.run(["pm", "list", "packages", "com.termux.api"],
+                                 capture_output=True, text=True, timeout=5,
+                                 check=False).stdout
+            _TERMUX_API_OK = "com.termux.api" in (out or "")
+        except Exception:                                         # noqa: BLE001
+            _TERMUX_API_OK = False
+    return _TERMUX_API_OK
+
+
+def _scan_paths(paths: list[str]) -> None:
+    """Tell Android's MediaProvider about new files (best effort)."""
+    if not paths:
+        return
+    if termux_api_available() and shutil.which("termux-media-scan"):
+        termux(["termux-media-scan", *paths], timeout=20)
+        return
+    # No Termux:API app -> ask the activity manager directly. The "--user 0"
+    # part matters: without it Android rejects the broadcast for this uid.
+    am = "/system/bin/am" if os.path.exists("/system/bin/am") else shutil.which("am")
+    if not am:
+        return
+    for p in paths:
+        try:
+            subprocess.run(
+                [am, "broadcast", "--user", "0",
+                 "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                 "-d", f"file://{p}"],
+                capture_output=True, text=True, timeout=15, check=False)
+        except Exception:                                         # noqa: BLE001
+            continue
+
+
+def media_scan(paths: list[str], wait: float = 8.0) -> None:
+    """Index downloaded files so the phone's Gallery app shows them.
+
+    Runs in a daemon thread so a slow/absent media scanner can never stall the
+    TUI, but we still join briefly (default 8s) so the usual case finishes
+    before the process exits. The scan itself is best effort.
+    """
+    paths = [str(p) for p in paths if p]
+    if not paths:
+        return
+    t = threading.Thread(target=_scan_paths, args=(paths,), daemon=True)
+    t.start()
+    try:
+        t.join(timeout=wait)
+    except KeyboardInterrupt:                                     # noqa: BLE001
+        pass
+
+
+# --------------------------------------------------------------------------- #
+#  list formats
+# --------------------------------------------------------------------------- #
+
+def list_formats(url, args):
+    with console.status(f"[{ACCENT}]Mengambil daftar format…[/]", spinner="dots"):
+        try:
+            info = _entry(_extract(url, args.playlist))
+        except Exception as exc:                                  # noqa: BLE001
+            console.print(f"[{BAD}]✖ {exc}[/]")
+            return
+    table = Table(title=f"[bold]{info.get('title')}[/]", box=box.SIMPLE_HEAVY,
+                  border_style=ACCENT, header_style=f"bold {ACCENT}")
+    for col in ("id", "ext", "resolusi", "fps", "vcodec", "acodec", "abr", "ukuran", "note"):
+        table.add_column(col)
+    for f in info.get("formats") or []:
+        size = f.get("filesize") or f.get("filesize_approx")
+        table.add_row(
+            str(f.get("format_id")), str(f.get("ext")),
+            str(f.get("resolution") or (f"{f['height']}p" if f.get("height") else "audio")),
+            str(f.get("fps") or "-"), str(f.get("vcodec") or "-"),
+            str(f.get("acodec") or "-"),
+            str(f.get("abr") or "-"), fmt_bytes(size) if size else "-",
+            str(f.get("format_note") or ""),
+        )
+    console.print(table)
+
+
+# --------------------------------------------------------------------------- #
+#  cli
+# --------------------------------------------------------------------------- #
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        prog="dl",
+        description="yt-dlp TUI downloader untuk Termux (auto simpan ke DCIM/ytdlmux, muncul di galeri).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="contoh:\n"
+               "  dl https://youtube.com/watch?v=xxxx\n"
+               "  dl -a https://youtu.be/xxxx\n"
+               "  dl -y -p https://youtube.com/playlist?list=xxxx\n",
+    )
+    p.add_argument("urls", nargs="*", help="URL video/audio (kosong = ambil dari clipboard)")
+    p.add_argument("-a", "--audio", action="store_true", help="hanya audio, konversi MP3 320k")
+    p.add_argument("-y", "--yes", action="store_true", help="lewati pemilih resolusi (kualitas terbaik)")
+    p.add_argument("-f", "--format", help="format selector yt-dlp manual")
+    p.add_argument("-p", "--playlist", action="store_true", help="unduh seluruh playlist")
+    p.add_argument("--playlist-items", help="subset playlist, contoh 1-5")
+    p.add_argument("-l", "--list", action="store_true", help="tampilkan daftar format lalu keluar")
+    p.add_argument("-o", "--out", help="folder tujuan (default: DCIM/ytdlmux di penyimpanan Android)")
+    p.add_argument("-s", "--sub", action="store_true", help="unduh + embed subtitle (id/en)")
+    p.add_argument("-x", "--proxy", help="proxy, contoh socks5://127.0.0.1:1080")
+    p.add_argument("--limit-rate", type=int, help="batas kecepatan dalam byte/detik")
+    p.add_argument("-U", "--update", action="store_true", help="update yt-dlp lalu keluar")
+    p.add_argument("-V", "--version", action="store_true", help="versi dl")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+
+    if args.version:
+        import yt_dlp
+        console.print(f"ytdlmux 1.0  ·  command: dl  ·  yt-dlp {yt_dlp.version.__version__}")
+        return 0
+
+    if args.update:
+        console.print(f"[{ACCENT}]Meng-update yt-dlp…[/]")
+        rc = subprocess.call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"])
+        return rc
+
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        console.print(f"[{BAD}]yt-dlp belum terinstall.[/] Jalankan: pip install -U yt-dlp")
+        return 1
+
+    outdir = Path(args.out).expanduser() if args.out else find_download_dir()
+    try:
+        outdir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        console.print(f"[{BAD}]Tidak bisa memakai folder {outdir}: {exc}[/]")
+        return 1
+
+    urls = list(args.urls)
+    if not urls:
+        clip = clipboard_url()
+        if clip:
+            console.print(f"[{DIM}]URL dari clipboard:[/] [white]{clip}[/]")
+            urls = [clip]
+        else:
+            console.print(
+                f"[{WARN}]Tidak ada URL.[/]\n"
+                f"Pakai: [bold {ACCENT}]dl <url>[/]   (atau copy URL ke clipboard lalu jalankan [bold]dl[/])")
+            return 1
+
+    if args.list:
+        for u in urls:
+            list_formats(u, args)
+        return 0
+
+    if not shutil.which("ffmpeg"):
+        console.print(f"[{WARN}]⚠ ffmpeg tidak ditemukan — penggabungan video+audio bisa gagal.[/]\n"
+                      f"[{DIM}]  pkg install ffmpeg[/]")
+
+    wake_lock(True)
+    rc = 0
+    try:
+        for i, url in enumerate(urls, 1):
+            if len(urls) > 1:
+                console.rule(f"[bold {ACCENT}]URL {i}/{len(urls)}[/]", style=ACCENT)
+            chosen = choose_format(url, args, outdir)
+            if chosen is None:
+                console.print(f"[{WARN}]Dilewati:[/] {url}")
+                continue
+            label, selector, pps, _kind = chosen
+
+            dl = Downloader(outdir, args)
+            dl.current_label = label
+            if not dl.download(url, selector, pps):
+                rc = 1
+            else:
+                notify("dl — selesai", f"{label} → {outdir}")
+    finally:
+        wake_lock(False)
+    return rc
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        console.print(f"\n[{WARN}]Dibatalkan.[/]")
+        sys.exit(130)
