@@ -147,8 +147,8 @@ try:
     )
 except ImportError:  # pragma: no cover
     sys.stderr.write(
-        "\n[!] 'rich' belum terinstall.\n"
-        "    Jalankan:  pip install rich prompt_toolkit\n\n"
+        "\n[!] 'rich' is not installed.\n"
+        "    Run:  pip install rich prompt_toolkit\n\n"
     )
     sys.exit(1)
 
@@ -232,7 +232,7 @@ def _entry(info):
         for e in info.get("entries") or []:
             if e:
                 return e
-        raise RuntimeError("playlist kosong")
+        raise RuntimeError("empty playlist")
     return info
 
 
@@ -281,7 +281,7 @@ def build_choices(info):
     choices = []
     # 1) best auto
     choices.append((
-        "[ BEST ]  Kualitas terbaik (auto)   — video+audio terbaik yang tersedia",
+        "[ BEST ]  Best quality (auto)   — best video+audio available",
         {"kind": "auto"},
     ))
 
@@ -296,7 +296,7 @@ def build_choices(info):
         if fps and fps >= 50:
             label += f"{int(fps)}"
         extra = f" · {note}" if note and note not in label else ""
-        size = f"  ~{fmt_bytes(total)}" if total else "  (ukuran ?)"
+        size = f"  ~{fmt_bytes(total)}" if total else "  (size ?)"
         star = "  ⭐" if h >= 1080 else ""
         choices.append((
             f"[ {label:<7} ]  {ext:<4} video+audio{size}{extra}{star}",
@@ -306,11 +306,11 @@ def build_choices(info):
 
     # 3) audio options
     choices.append((
-        "[ AUDIO ]  MP3 320 kbps (konversi ffmpeg)",
+        "[ AUDIO ]  MP3 320 kbps (ffmpeg conversion)",
         AUDIO_CHOICE,
     ))
     choices.append((
-        "[ AUDIO ]  M4A asli (tanpa konversi, lebih cepat)",
+        "[ AUDIO ]  Original M4A (no conversion, faster)",
         {"kind": "audio_m4a"},
     ))
     return choices
@@ -337,7 +337,7 @@ def pick_with_prompt_toolkit(choices, title, subtitle):
         title=title,
         text=HTML(
             f"<b>{subtitle}</b>\n"
-            "<ansigray>↑/↓ pilih · Enter download · Ctrl-C batal</ansigray>"
+            "<ansigray>↑/↓ select · Enter download · Ctrl-C cancel</ansigray>"
         ),
         values=[(i, label) for i, (label, _) in enumerate(choices)],
         style=style,
@@ -354,14 +354,14 @@ def pick_fallback(choices, title, subtitle):
         console.print(f"  [bold {ACCENT}]{i:>2}[/]  {label}")
     console.print()
     while True:
-        raw = console.input(f"[bold {ACCENT}]Pilih nomor[/] (Enter=1, q=batal): ").strip()
+        raw = console.input(f"[bold {ACCENT}]Pick a number[/] (Enter=1, q=cancel): ").strip()
         if raw.lower() in ("q", "quit", "exit"):
             return None
         if raw == "":
             return choices[0][1]
         if raw.isdigit() and 1 <= int(raw) <= len(choices):
             return choices[int(raw) - 1][1]
-        console.print(f"[{BAD}]Nomor tidak valid.[/]")
+        console.print(f"[{BAD}]Invalid number.[/]")
 
 
 def choose_format(url, args, outdir):
@@ -375,12 +375,12 @@ def choose_format(url, args, outdir):
     if args.yes or not interactive:
         return ("Best available", _best_selector(), None, "auto")
 
-    with console.status(f"[{ACCENT}]Mengambil daftar format…[/]", spinner="dots"):
+    with console.status(f"[{ACCENT}]Fetching format list…[/]", spinner="dots"):
         try:
             info = _entry(_extract(url, args.playlist))
         except Exception as exc:                                  # noqa: BLE001
             console.print(Panel(Text(str(exc), style=BAD),
-                                title="[bold red]Gagal mengambil info[/]",
+                                title="[bold red]Failed to fetch info[/]",
                                 border_style=BAD))
             return None
 
@@ -398,9 +398,9 @@ def choose_format(url, args, outdir):
 
     choices = build_choices(info)
     try:
-        picked = pick_with_prompt_toolkit(choices, " dl — pilih kualitas ", sub)
+        picked = pick_with_prompt_toolkit(choices, " dl — pick quality ", sub)
     except Exception:                                             # noqa: BLE001
-        picked = pick_fallback(choices, "dl — pilih kualitas", sub)
+        picked = pick_fallback(choices, "dl — pick quality", sub)
 
     if picked is None:
         return None
@@ -422,7 +422,7 @@ def choice_to_plan(picked):
         return (f"{picked.get('label', fid)} {picked.get('ext', '')}".strip(),
                 sel, None, "video")
     if kind == "audio_m4a":
-        return ("M4A (asli)", "bestaudio[ext=m4a]/bestaudio/best", None, "audio")
+        return ("M4A (original)", "bestaudio[ext=m4a]/bestaudio/best", None, "audio")
     if kind == "audio_mp3":
         return ("MP3 320 kbps", "bestaudio/best", _audio_pp(), "audio")
     return ("Best available", _best_selector(), None, "auto")
@@ -502,11 +502,11 @@ class Downloader:
         t = Text()
         t.append("  ⬇  dl  ", style=f"bold white on {ACCENT}")
         t.append("   yt-dlp TUI downloader\n", style=f"bold {ACCENT}")
-        t.append("  Tujuan   ", style=DIM)
+        t.append("  Target   ", style=DIM)
         t.append(f"{self.outdir}\n", style="bold white")
         t.append("  Format   ", style=DIM)
         t.append(f"{self.current_label or '-'}\n", style=f"bold {OK}")
-        t.append("  Selesai  ", style=DIM)
+        t.append("  Done     ", style=DIM)
         t.append(f"{len(self.finished_files)} file", style="bold white")
         return Panel(t, border_style=ACCENT, box=box.ROUNDED, padding=(0, 1))
 
@@ -664,15 +664,15 @@ class Downloader:
                 with YoutubeDL(opts) as ydl:
                     ydl.download([url])
             except KeyboardInterrupt:
-                console.print(f"\n[{WARN}]Dibatalkan oleh user.[/]")
+                console.print(f"\n[{WARN}]Cancelled by user.[/]")
                 ok = False
             except Exception as exc:                              # noqa: BLE001
                 console.print(Panel(Text(str(exc), style=BAD),
-                                    title="[bold red]Download gagal[/]",
+                                    title="[bold red]Download failed[/]",
                                     border_style=BAD))
                 ok = False
             finally:
-                self.progress.update(self.overall_id, description="SELESAI",
+                self.progress.update(self.overall_id, description="FINISHED",
                                      refresh=False)
 
         console.print()
@@ -698,13 +698,13 @@ class Downloader:
             if in_gallery:
                 media_scan(existing)
             body = Text()
-            body.append("✔  Download selesai\n", style=f"bold {OK}")
+            body.append("✔  Download complete\n", style=f"bold {OK}")
             body.append(f"   {len(files) or 1} file · {fmt_dur(elapsed)}\n", style=DIM)
             for f in files[-6:]:
                 body.append(f"   {Path(f).name}\n", style="white")
             body.append(f"   → {self.outdir}\n", style=f"bold {ACCENT}")
             if in_gallery:
-                body.append("   📱 muncul di galeri HP", style=DIM)
+                body.append("   📱 now visible in your phone's gallery", style=DIM)
             console.print(Panel(body, border_style=OK, box=box.ROUNDED))
         return ok
 
@@ -828,7 +828,7 @@ def media_scan(paths: list[str], wait: float = 8.0) -> None:
 # --------------------------------------------------------------------------- #
 
 def list_formats(url, args):
-    with console.status(f"[{ACCENT}]Mengambil daftar format…[/]", spinner="dots"):
+    with console.status(f"[{ACCENT}]Fetching format list…[/]", spinner="dots"):
         try:
             info = _entry(_extract(url, args.playlist))
         except Exception as exc:                                  # noqa: BLE001
@@ -836,7 +836,7 @@ def list_formats(url, args):
             return
     table = Table(title=f"[bold]{info.get('title')}[/]", box=box.SIMPLE_HEAVY,
                   border_style=ACCENT, header_style=f"bold {ACCENT}")
-    for col in ("id", "ext", "resolusi", "fps", "vcodec", "acodec", "abr", "ukuran", "note"):
+    for col in ("id", "ext", "resolution", "fps", "vcodec", "acodec", "abr", "size", "note"):
         table.add_column(col)
     for f in info.get("formats") or []:
         size = f.get("filesize") or f.get("filesize_approx")
@@ -858,26 +858,26 @@ def list_formats(url, args):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="dl",
-        description="yt-dlp TUI downloader untuk Termux (auto simpan ke DCIM/ytdlmux, muncul di galeri).",
+        description="yt-dlp TUI downloader for Termux (auto-saves to DCIM/ytdlmux, shows up in the gallery).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="contoh:\n"
+        epilog="examples:\n"
                "  dl https://youtube.com/watch?v=xxxx\n"
                "  dl -a https://youtu.be/xxxx\n"
                "  dl -y -p https://youtube.com/playlist?list=xxxx\n",
     )
-    p.add_argument("urls", nargs="*", help="URL video/audio (kosong = ambil dari clipboard)")
-    p.add_argument("-a", "--audio", action="store_true", help="hanya audio, konversi MP3 320k")
-    p.add_argument("-y", "--yes", action="store_true", help="lewati pemilih resolusi (kualitas terbaik)")
-    p.add_argument("-f", "--format", help="format selector yt-dlp manual")
-    p.add_argument("-p", "--playlist", action="store_true", help="unduh seluruh playlist")
-    p.add_argument("--playlist-items", help="subset playlist, contoh 1-5")
-    p.add_argument("-l", "--list", action="store_true", help="tampilkan daftar format lalu keluar")
-    p.add_argument("-o", "--out", help="folder tujuan (default: DCIM/ytdlmux di penyimpanan Android)")
-    p.add_argument("-s", "--sub", action="store_true", help="unduh + embed subtitle (id/en)")
-    p.add_argument("-x", "--proxy", help="proxy, contoh socks5://127.0.0.1:1080")
-    p.add_argument("--limit-rate", type=int, help="batas kecepatan dalam byte/detik")
-    p.add_argument("-U", "--update", action="store_true", help="update yt-dlp lalu keluar")
-    p.add_argument("-V", "--version", action="store_true", help="versi dl")
+    p.add_argument("urls", nargs="*", help="video/audio URL (empty = take from clipboard)")
+    p.add_argument("-a", "--audio", action="store_true", help="audio only, convert to MP3 320k")
+    p.add_argument("-y", "--yes", action="store_true", help="skip the resolution picker (best quality)")
+    p.add_argument("-f", "--format", help="manual yt-dlp format selector")
+    p.add_argument("-p", "--playlist", action="store_true", help="download the whole playlist")
+    p.add_argument("--playlist-items", help="playlist subset, e.g. 1-5")
+    p.add_argument("-l", "--list", action="store_true", help="show the format list then exit")
+    p.add_argument("-o", "--out", help="target folder (default: DCIM/ytdlmux on Android storage)")
+    p.add_argument("-s", "--sub", action="store_true", help="download + embed subtitles (id/en)")
+    p.add_argument("-x", "--proxy", help="proxy, e.g. socks5://127.0.0.1:1080")
+    p.add_argument("--limit-rate", type=int, help="speed limit in bytes/second")
+    p.add_argument("-U", "--update", action="store_true", help="update yt-dlp then exit")
+    p.add_argument("-V", "--version", action="store_true", help="dl version")
     return p.parse_args(argv)
 
 
@@ -890,33 +890,33 @@ def main(argv=None) -> int:
         return 0
 
     if args.update:
-        console.print(f"[{ACCENT}]Meng-update yt-dlp…[/]")
+        console.print(f"[{ACCENT}]Updating yt-dlp…[/]")
         rc = subprocess.call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"])
         return rc
 
     try:
         import yt_dlp  # noqa: F401
     except ImportError:
-        console.print(f"[{BAD}]yt-dlp belum terinstall.[/] Jalankan: pip install -U yt-dlp")
+        console.print(f"[{BAD}]yt-dlp is not installed.[/] Run: pip install -U yt-dlp")
         return 1
 
     outdir = Path(args.out).expanduser() if args.out else find_download_dir()
     try:
         outdir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        console.print(f"[{BAD}]Tidak bisa memakai folder {outdir}: {exc}[/]")
+        console.print(f"[{BAD}]Cannot use folder {outdir}: {exc}[/]")
         return 1
 
     urls = list(args.urls)
     if not urls:
         clip = clipboard_url()
         if clip:
-            console.print(f"[{DIM}]URL dari clipboard:[/] [white]{clip}[/]")
+            console.print(f"[{DIM}]URL from clipboard:[/] [white]{clip}[/]")
             urls = [clip]
         else:
             console.print(
-                f"[{WARN}]Tidak ada URL.[/]\n"
-                f"Pakai: [bold {ACCENT}]dl <url>[/]   (atau copy URL ke clipboard lalu jalankan [bold]dl[/])")
+                f"[{WARN}]No URL.[/]\n"
+                f"Use: [bold {ACCENT}]dl <url>[/]   (or copy a URL to the clipboard and just run [bold]dl[/])")
             return 1
 
     if args.list:
@@ -925,7 +925,7 @@ def main(argv=None) -> int:
         return 0
 
     if not shutil.which("ffmpeg"):
-        console.print(f"[{WARN}]⚠ ffmpeg tidak ditemukan — penggabungan video+audio bisa gagal.[/]\n"
+        console.print(f"[{WARN}]⚠ ffmpeg not found — merging video+audio may fail.[/]\n"
                       f"[{DIM}]  pkg install ffmpeg[/]")
 
     wake_lock(True)
@@ -936,7 +936,7 @@ def main(argv=None) -> int:
                 console.rule(f"[bold {ACCENT}]URL {i}/{len(urls)}[/]", style=ACCENT)
             chosen = choose_format(url, args, outdir)
             if chosen is None:
-                console.print(f"[{WARN}]Dilewati:[/] {url}")
+                console.print(f"[{WARN}]Skipped:[/] {url}")
                 continue
             label, selector, pps, _kind = chosen
 
@@ -945,7 +945,7 @@ def main(argv=None) -> int:
             if not dl.download(url, selector, pps):
                 rc = 1
             else:
-                notify("dl — selesai", f"{label} → {outdir}")
+                notify("dl — done", f"{label} → {outdir}")
     finally:
         wake_lock(False)
     return rc
@@ -955,5 +955,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        console.print(f"\n[{WARN}]Dibatalkan.[/]")
+        console.print(f"\n[{WARN}]Cancelled.[/]")
         sys.exit(130)

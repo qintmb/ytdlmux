@@ -1,65 +1,65 @@
 # ytdlmux
 
-**Downloader video/audio untuk Termux Android dengan tampilan TUI interaktif.**
+**Video/audio downloader for Termux on Android with an interactive TUI.**
 
-`ytdlmux` membungkus [yt-dlp](https://github.com/yt-dlp/yt-dlp) dengan antarmuka
-terminal yang rapi: pemilih resolusi, progress bar, kecepatan download, ETA, dan
-daftar format. Hasil download otomatis disimpan ke **`DCIM/ytdlmux`** di
-penyimpanan Android, lalu didaftarkan ke media scanner — jadi videonya **langsung
-muncul di aplikasi Galeri** HP, bukan tersembunyi di folder internal Termux.
+`ytdlmux` wraps [yt-dlp](https://github.com/yt-dlp/yt-dlp) in a clean terminal
+interface: a resolution picker, progress bar, download speed, ETA, and a format
+list. Downloads are saved to **`DCIM/ytdlmux`** on Android storage and registered
+with the media scanner — so your videos **show up right in the phone's Gallery
+app**, instead of hiding inside Termux's private folder.
 
-Perintahnya pendek: **`dl`**.
+The command is short: **`dl`**.
 
 ```
   ⬇  ytdlmux   yt-dlp TUI downloader
-  Tujuan   /storage/emulated/0/DCIM/ytdlmux
+  Target   /storage/emulated/0/DCIM/ytdlmux
   Format   1080p mp4
-  Selesai  1 file
+  Done     1 file
  ─────────────────────────────────────────────────────────────
   ⠹ 🎬 1080p ━━━━━━━━━━━━━━━━━━━━━━━━━━━ 24.3/48.1 MB  2.1 MB/s  00:11  0:00:12
 ```
 
 ---
 
-## Fitur
+## Features
 
-| Fitur | Keterangan |
+| Feature | Description |
 |---|---|
-| **TUI interaktif** | Pilih resolusi/format lewat menu, bukan mengetik flag panjang |
-| **Progress bar live** | Bar, kecepatan, ETA, dan waktu berjalan real-time |
-| **Simpan ke Galeri** | Output ke `DCIM/ytdlmux` + auto media-scan Android |
-| **Video + audio terbaik** | Otomatis menggabungkan stream terbaik (butuh `ffmpeg`) |
-| **Audio MP3 320k** | Konversi audio dengan `-a` |
-| **Playlist** | Unduh seluruh playlist dengan `-p` |
-| **Subtitle** | Unduh & embed subtitle Indonesia/Inggris dengan `-s` |
-| **Clipboard** | Jalankan `dl` tanpa argumen untuk mengambil URL dari clipboard |
-| **Notifikasi** | Notifikasi Android saat download selesai (Termux:API) |
-| **Wake lock** | CPU tetap bangun selama download berjalan |
-| **Fallback aman** | Tetap jalan walau Termux:API tidak terpasang |
+| **Interactive TUI** | Pick resolution/format from a menu instead of typing long flags |
+| **Live progress bar** | Real-time bar, speed, ETA, and elapsed time |
+| **Saves to Gallery** | Output to `DCIM/ytdlmux` + automatic Android media scan |
+| **Best video + audio** | Automatically merges the best streams (requires `ffmpeg`) |
+| **MP3 320k audio** | Convert audio with `-a` |
+| **Playlists** | Download a whole playlist with `-p` |
+| **Subtitles** | Download & embed Indonesian/English subtitles with `-s` |
+| **Clipboard** | Run `dl` with no arguments to grab the URL from the clipboard |
+| **Notifications** | Android notification when a download finishes (Termux:API) |
+| **Wake lock** | Keeps the CPU awake while a download is running |
+| **Safe fallback** | Still works even without Termux:API installed |
 
 ---
 
-## Cara Instalasi di Termux (Android)
+## Installing on Termux (Android)
 
 ### 1. Install Termux
 
-Pasang **Termux** dari **F-Droid** (disarankan) atau GitHub Releases:
+Install **Termux** from **F-Droid** (recommended) or GitHub Releases:
 
 - <https://f-droid.org/packages/com.termux/>
 
-> ⚠️ **Jangan** pakai Termux dari Google Play — versinya sudah usang dan
-> `pkg install` sering gagal.
+> ⚠️ Do **not** use Termux from Google Play — that version is outdated and
+> `pkg install` often fails.
 
-### 2. Izinkan akses penyimpanan
+### 2. Grant storage access
 
 ```bash
 termux-setup-storage
 ```
 
-Setujui dialog izin yang muncul. Ini wajib, karena folder `DCIM` ada di
-penyimpanan bersama Android.
+Approve the permission dialog that appears. This is required, because the `DCIM`
+folder lives in Android's shared storage.
 
-### 3. Install dependensi
+### 3. Install dependencies
 
 ```bash
 pkg update -y && pkg upgrade -y
@@ -67,98 +67,98 @@ pkg install -y python ffmpeg nodejs git
 pip install -U yt-dlp rich prompt_toolkit
 ```
 
-Keterangan:
+Details:
 
-- `python` — menjalankan skrip
-- `ffmpeg` — menggabungkan video+audio & konversi MP3
-- `nodejs` — JavaScript runtime, agar ekstraksi YouTube tetap didukung yt-dlp
-- `rich` — tampilan TUI
-- `prompt_toolkit` — menu pemilih resolusi
+- `python` — runs the script
+- `ffmpeg` — merges video+audio & converts to MP3
+- `nodejs` — JavaScript runtime, so yt-dlp keeps supporting YouTube extraction
+- `rich` — the TUI display
+- `prompt_toolkit` — the resolution picker menu
 
-### 4. Ambil project ini
+### 4. Get this project
 
 ```bash
 git clone https://github.com/qintmb/ytdlmux.git
 cd ytdlmux
 ```
 
-### 5. Install perintah `dl`
+### 5. Install the `dl` command
 
-Cara otomatis:
+Automatic:
 
 ```bash
 bash install.sh
 ```
 
-Atau manual:
+Or manual:
 
 ```bash
 install -m 755 dl "$PREFIX/bin/dl"
 mkdir -p ~/storage/dcim/ytdlmux
 ```
 
-### 6. Selesai — coba download
+### 6. Done — try a download
 
 ```bash
 dl -y "https://youtu.be/VIDEO_ID"
 ```
 
-File akan muncul di **DCIM/ytdlmux** dan tampil di aplikasi Galeri.
+The file will appear in **DCIM/ytdlmux** and show up in the Gallery app.
 
 ---
 
-## Cara Pakai
+## Usage
 
 ```bash
-dl <url>                    # pilih resolusi lewat menu, lalu download
-dl -y <url>                 # langsung kualitas terbaik (tanpa menu)
-dl -a <url>                 # hanya audio -> MP3 320 kbps
-dl -l <url>                 # lihat daftar format yang tersedia
-dl -f "137+140" <url>       # format selector yt-dlp manual
-dl -p <url>                 # unduh seluruh playlist
-dl --playlist-items 1-5 <url>   # hanya item 1–5 dari playlist
-dl -s <url>                 # unduh + embed subtitle (id/en)
-dl -o ~/storage/movies <url>    # ganti folder tujuan
-dl -x socks5://127.0.0.1:1080 <url>  # lewat proxy
-dl --limit-rate 500000 <url>     # batasi kecepatan (byte/detik)
-dl                          # ambil URL dari clipboard Android
+dl <url>                    # pick a resolution from the menu, then download
+dl -y <url>                 # go straight to best quality (no menu)
+dl -a <url>                 # audio only -> MP3 320 kbps
+dl -l <url>                 # list the available formats
+dl -f "137+140" <url>       # manual yt-dlp format selector
+dl -p <url>                 # download the whole playlist
+dl --playlist-items 1-5 <url>   # only items 1–5 of the playlist
+dl -s <url>                 # download + embed subtitles (id/en)
+dl -o ~/storage/movies <url>    # change the target folder
+dl -x socks5://127.0.0.1:1080 <url>  # through a proxy
+dl --limit-rate 500000 <url>     # limit speed (bytes/second)
+dl                          # grab the URL from the Android clipboard
 dl -U                       # update yt-dlp
-dl -V                       # cek versi
+dl -V                       # check the version
 ```
 
-### Contoh
+### Examples
 
 ```bash
-# Video kualitas terbaik
+# Best-quality video
 dl -y "https://youtu.be/dQw4w9WgXcQ"
 
-# Ekstrak audio ke MP3
+# Extract audio to MP3
 dl -a "https://youtu.be/dQw4w9WgXcQ"
 
-# Unduh playlist lengkap, pilih kualitas otomatis
+# Download a full playlist, auto-pick quality
 dl -y -p "https://youtube.com/playlist?list=XXXX"
 
-# Copy URL di browser HP, lalu cukup jalankan:
+# Copy a URL in the phone's browser, then just run:
 dl
 ```
 
 ---
 
-## Ke Mana File Disimpan?
+## Where Are Files Saved?
 
-Secara default: **`/storage/emulated/0/DCIM/ytdlmux`**
+By default: **`/storage/emulated/0/DCIM/ytdlmux`**
 
-Folder `DCIM` adalah lokasi standar galeri Android, jadi hasil download langsung
-terindeks oleh aplikasi Galeri, Google Photos, dan pemutar video lainnya.
+The `DCIM` folder is Android's standard gallery location, so downloads are
+indexed directly by the Gallery app, Google Photos, and other video players.
 
-Skrip otomatis memanggil media scanner setelah download selesai. Kalau file belum
-muncul di galeri, scan manual:
+The script automatically calls the media scanner once a download finishes. If a
+file doesn't show up in the gallery, scan manually:
 
 ```bash
 termux-media-scan -r ~/storage/dcim/ytdlmux
 ```
 
-Urutan folder yang dicoba (dipakai yang pertama bisa ditulis):
+The folders tried, in order (the first writable one is used):
 
 1. `/storage/emulated/0/DCIM/ytdlmux`
 2. `/sdcard/DCIM/ytdlmux`
@@ -166,78 +166,79 @@ Urutan folder yang dicoba (dipakai yang pertama bisa ditulis):
 4. `~/storage/downloads`
 5. `~/Downloads`
 
-Untuk memakai folder lain, gunakan `-o`.
+To use a different folder, pass `-o`.
 
 ---
 
-## Termux:API (opsional)
+## Termux:API (optional)
 
-Beberapa fitur tambahan butuh aplikasi **Termux:API**:
+A few extra features need the **Termux:API** app:
 
-- ambil URL dari clipboard (`dl` tanpa argumen)
-- notifikasi saat download selesai
-- `termux-media-scan` resmi
+- grabbing a URL from the clipboard (`dl` with no arguments)
+- notifications when a download finishes
+- the official `termux-media-scan`
 
 ```bash
 pkg install -y termux-api
 ```
 
-Lalu pasang aplikasi **Termux:API** dari F-Droid:
+Then install the **Termux:API** app from F-Droid:
 
 - <https://f-droid.org/packages/com.termux.api/>
 
-Tanpa Termux:API, `ytdlmux` tetap berfungsi normal: media scan otomatis memakai
-`am broadcast` bawaan Android, dan fitur clipboard/notifikasi dilewati.
+Without Termux:API, `ytdlmux` still works normally: the automatic media scan uses
+Android's built-in `am broadcast`, and the clipboard/notification features are
+skipped.
 
 ---
 
 ## Troubleshooting
 
 **`ytdlmux: command not found`**
-Pastikan `$PREFIX/bin` ada di `PATH`:
+Make sure `$PREFIX/bin` is on your `PATH`:
 
 ```bash
 echo 'export PATH="$PREFIX/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 ```
 
-**Error `Unable to extract` / video YouTube gagal**
-yt-dlp perlu sering di-update:
+**`Unable to extract` error / YouTube video fails**
+yt-dlp needs frequent updates:
 
 ```bash
 dl -U
 ```
 
-**Penggabungan video+audio gagal**
-`ffmpeg` belum terpasang:
+**Merging video+audio fails**
+`ffmpeg` is not installed:
 
 ```bash
 pkg install -y ffmpeg
 ```
 
-**File tidak muncul di galeri**
-Jalankan scan manual, lalu buka ulang aplikasi Galeri:
+**File doesn't show up in the gallery**
+Run a manual scan, then reopen the Gallery app:
 
 ```bash
 termux-media-scan -r ~/storage/dcim/ytdlmux
 ```
 
-**Izin penyimpanan hilang setelah update Termux**
-Jalankan `termux-setup-storage` lagi.
+**Storage permission is lost after a Termux update**
+Run `termux-setup-storage` again.
 
-**Download terasa lambat**
-Android membatasi proses latar belakang. Nonaktifkan optimasi baterai untuk
-Termux di *Settings → Apps → Termux → Battery*.
+**Downloads feel slow**
+Android throttles background processes. Disable battery optimization for
+Termux under *Settings → Apps → Termux → Battery*.
 
 ---
 
-## Struktur Project
+## Project Structure
 
 ```
 ytdlmux/
-├── dl           # skrip utama (Python), dipasang sebagai perintah `dl`
-├── install.sh   # installer otomatis untuk Termux
-├── README.md    # dokumentasi ini
-├── LICENSE      # lisensi MIT
+├── dl           # main script (Python), installed as the `dl` command
+├── install.sh   # automatic installer for Termux
+├── README.md    # this documentation
+├── LICENSE      # MIT license
 └── .gitignore
 ```
 
@@ -245,18 +246,18 @@ ytdlmux/
 
 ## Requirements
 
-- Termux (F-Droid) + Android 7.0 atau lebih baru
+- Termux (F-Droid) + Android 7.0 or newer
 - Python 3.8+
 - `yt-dlp`, `rich`, `prompt_toolkit`
-- `ffmpeg` (untuk merge video+audio & konversi MP3)
-- `nodejs` (disarankan, untuk ekstraksi YouTube)
+- `ffmpeg` (for merging video+audio & MP3 conversion)
+- `nodejs` (recommended, for YouTube extraction)
 
 ---
 
-## Lisensi
+## License
 
-MIT — lihat [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
 
-Project ini hanya pembungkus antarmuka. Mesin unduhnya adalah
-[yt-dlp](https://github.com/yt-dlp/yt-dlp). Hormati hak cipta dan
-Ketentuan Layanan situs yang kamu unduh.
+This project is only an interface wrapper. The download engine is
+[yt-dlp](https://github.com/yt-dlp/yt-dlp). Respect copyright and the
+Terms of Service of the sites you download from.
