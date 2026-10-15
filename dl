@@ -36,7 +36,7 @@ from pathlib import Path
 #  version / project
 # --------------------------------------------------------------------------- #
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 GITHUB_REPO = "qintmb/ytdlmux"
 GITHUB_RAW = f"https://raw.githubusercontent.com/{GITHUB_REPO}"
@@ -1054,6 +1054,17 @@ def _version_key(tag: str) -> tuple:
     return tuple(out) or (0,)
 
 
+def _looks_like_dl(body: str) -> bool:
+    """Cheap sanity check that we fetched the real dl script, not an error page.
+
+    An HTML error page or a 404 body would otherwise overwrite a working
+    install; requiring our marker strings makes that impossible.
+    """
+    return ("VERSION = " in body
+            and "GITHUB_REPO = " in body
+            and "def self_update" in body)
+
+
 def _installed_script_path() -> Path | None:
     """Real path of this running script (resolving the `dl` on PATH)."""
     for candidate in (Path(__file__), Path(sys.argv[0])):
@@ -1090,34 +1101,141 @@ def _replace_running_script(path: Path, new_text: str) -> bool:
         return False
 
 
-def self_update() -> int:
-    """`dl -U`: update yt-dlp, then this script from the latest release tag."""
-    rc = 0
+def _python_too_old() -> bool:
+    """True when running on a Python older than what yt-dlp fully supports.
 
-    console.print(f"[{ACCENT}]Updating yt-dlp…[/]")
+    yt-dlp still runs on 3.9 but has deprecated it, and newer YouTube
+    extraction paths break there ("The page needs to be reloaded" surfaces this
+    way). Warning early turns a confusing failure into an actionable message.
+    """
+    return sys.version_info < (3, 10)
+
+
+def _other_pythons() -> list[str]:
+    """Newer python interpreters on PATH that could run dl instead."""
+    found = []
+    for minor in range(10, 15):
+        exe = shutil.which(f"python3.{minor}")
+        if exe:
+            found.append(f"python3.{minor}")
+    return found
+
+
+def _python_hint() -> str:
+    """Short, per-OS hint for getting a newer Python."""
+    if IS_ANDROID:
+        return "pkg install python   (then re-run: pip install -U yt-dlp)"
+    if IS_MAC:
+        return "brew install python@3.12   (then reinstall yt-dlp for it)"
+    if IS_WIN:
+        return "winget install Python.Python.3.12"
+    return "sudo apt install python3.12   (or your distro's newer python3)"
+
+
+def _ytdlp_version() -> str | None:
+    """Installed yt-dlp version, or None when unavailable."""
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"])
-    except Exception as exc:                                      # noqa: BLE001
-        console.print(f"[{WARN}]⚠ yt-dlp update failed: {exc}[/]")
-        rc = 1
+        import yt_dlp
+        return yt_dlp.version.__version__
+    except Exception:                                             # noqa: BLE001
+        return None
 
-    console.print(f"[{ACCENT}]Checking ytdlmux releases…[/]")
+
+def _latest_pypi_version(pkg: str = "yt-dlp") -> str | None:
+    """Newest version on PyPI, used to report yt-dlp status without pip noise."""
+    try:
+        import json
+        data = json.loads(_http_get(f"https://pypi.org/pypi/{pkg}/json", timeout=15))
+        return (data.get("info") or {}).get("version")
+    except Exception:                                             # noqa: BLE001
+        return None
+
+
+def update_ytdlp() -> tuple[bool, str]:
+    """Upgrade yt-dlp via pip. Returns (ok, human summary).
+
+    Reporting note: pip's own output is silenced because it interleaves with the
+    rich TUI; we only surface a short verdict.
+    """
+    before = _ytdlp_version()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-U", "--quiet", "yt-dlp"],
+            capture_output=True, text=True, timeout=600)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            return False, detail[-1] if detail else f"pip exited {proc.returncode}"
+    except Exception as exc:                                      # noqa: BLE001
+        return False, str(exc)
+
+    after = _ytdlp_version()
+    if before and after and _version_key(after) > _version_key(before):
+        return True, f"{before} → {after}"
+    if after:
+        return True, f"{after} (already latest)"
+    return True, "updated"
+
+
+def self_update(assume_yes: bool = False) -> int:
+    """`dl -U`: check and update BOTH yt-dlp and ytdlmux.
+
+    Two independent checks:
+
+      1. yt-dlp  — upgraded through pip (issues a deprecation warning on 3.9).
+      2. ytdlmux — compared against the latest GitHub *release* tag, then the
+                   script itself is replaced in place. No re-clone needed.
+
+    Only the `dl` script is fetched; nothing else in the repo is touched, so a
+    git checkout at any commit still updates cleanly.
+    """
+    rc = 0
+    console.print(f"[bold {ACCENT}]Checking for updates[/]  "
+                  f"[{DIM}](ytdlmux v{VERSION})[/]")
+
+    # ---- 1/2  yt-dlp -----------------------------------------------------
+    cur_ytdlp = _ytdlp_version()
+    console.print(f"  [1/2] yt-dlp       [{DIM}]installed: {cur_ytdlp or 'not installed'}[/]")
+    latest_ytdlp = _latest_pypi_version()
+    if latest_ytdlp:
+        console.print(f"       {'':9} [{DIM}]latest:    {latest_ytdlp}[/]")
+
+    if cur_ytdlp and latest_ytdlp and _version_key(latest_ytdlp) <= _version_key(cur_ytdlp):
+        console.print(f"       [{OK}]✔ yt-dlp is up to date[/]")
+    else:
+        console.print(f"       [{ACCENT}]→ updating yt-dlp…[/]")
+        ok, summary = update_ytdlp()
+        if ok:
+            console.print(f"       [{OK}]✔ yt-dlp {summary}[/]")
+        else:
+            console.print(f"       [{WARN}]⚠ yt-dlp update failed: {summary}[/]")
+            console.print(f"       [{DIM}]  try manually: "
+                          f"{Path(sys.executable).name} -m pip install -U yt-dlp[/]")
+            rc = 1
+
+    # ---- 2/2  ytdlmux itself ---------------------------------------------
+    console.print(f"  [2/2] ytdlmux      [{DIM}]installed: v{VERSION}[/]")
     tag = _latest_release_tag()
     if not tag:
-        console.print(f"[{DIM}]  Could not reach GitHub — script left as is.[/]")
+        console.print(f"       [{DIM}]could not reach GitHub — script left as is[/]")
+        if rc == 0:
+            console.print(f"\n[{OK}]Done.[/]")
         return rc
 
+    console.print(f"       {'':9} [{DIM}]latest:    {tag}[/]")
+
     if _version_key(tag) <= _version_key(VERSION):
-        console.print(f"[{OK}]✔ ytdlmux already up to date[/] "
-                      f"[{DIM}](v{VERSION}, latest {tag})[/]")
+        console.print(f"       [{OK}]✔ ytdlmux is up to date[/]")
+        console.print(f"\n[{OK}]Done.[/]")
         return rc
 
     path = _installed_script_path()
     if not path:
-        console.print(f"[{WARN}]⚠ Cannot locate the running dl script; skipped.[/]")
+        console.print(f"       [{WARN}]⚠ cannot locate the running dl script[/]")
         return rc
 
-    # Prefer the tagged raw file; fall back to main if the tag has no asset.
+    console.print(f"       [{ACCENT}]→ downloading {tag}…[/]")
+    # Try the release tag first; fall back to main so a tag without the file
+    # (or a newly created release) still upgrades.
     for url in (f"{GITHUB_RAW}/{tag}/dl", f"{GITHUB_RAW}/main/dl"):
         try:
             body = _http_get(url, timeout=20)
@@ -1125,12 +1243,22 @@ def self_update() -> int:
             continue
         if not body.lstrip().startswith("#!"):
             continue                                              # sanity check
+        if not _looks_like_dl(body):
+            console.print(f"       [{WARN}]⚠ downloaded file is not the dl script; skipped[/]")
+            continue
         if _replace_running_script(path, body):
-            console.print(f"[{OK}]✔ ytdlmux updated {VERSION} → {tag}[/]  "
-                          f"[{DIM}]{path}[/]")
-        return rc
+            console.print(f"       [{OK}]✔ ytdlmux updated v{VERSION} → {tag}[/]")
+            console.print(f"       [{DIM}]  {path}[/]")
+            console.print(f"       [{DIM}]  restart dl to use the new version[/]")
+        else:
+            rc = 1
+        break
+    else:
+        console.print(f"       [{WARN}]⚠ download of {tag} failed; script unchanged[/]")
+        rc = 1
 
-    console.print(f"[{WARN}]⚠ Download of {tag} failed; script left unchanged.[/]")
+    if rc == 0:
+        console.print(f"\n[{OK}]Update complete.[/]")
     return rc
 
 
@@ -1193,6 +1321,8 @@ def parse_args(argv=None):
     p.add_argument("-U", "--update", action="store_true",
                    help="update yt-dlp + ytdlmux from the latest release, then exit")
     p.add_argument("-V", "--version", action="store_true", help="dl version")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="suppress environment warnings")
     return p.parse_args(argv)
 
 
@@ -1207,7 +1337,12 @@ def main(argv=None) -> int:
             ytv = "not installed"
         plat = ("Android/Termux" if IS_ANDROID else
                 "macOS" if IS_MAC else "Windows" if IS_WIN else "Linux")
-        console.print(f"ytdlmux {VERSION}  ·  command: dl  ·  {plat}  ·  yt-dlp {ytv}")
+        py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        console.print(f"ytdlmux {VERSION}  ·  command: dl  ·  {plat}")
+        console.print(f"yt-dlp {ytv}  ·  python {py}  ·  {sys.executable}")
+        if _python_too_old():
+            console.print(f"[{WARN}]⚠ python {py} is old — yt-dlp may fail to "
+                          f"extract YouTube. Upgrade: {_python_hint()}[/]")
         return 0
 
     if args.update:
@@ -1218,6 +1353,16 @@ def main(argv=None) -> int:
     except ImportError:
         console.print(f"[{BAD}]yt-dlp is not installed.[/] Run: pip install -U yt-dlp")
         return 1
+
+    # Old Pythons break modern YouTube extraction; say so now rather than
+    # letting it surface later as an opaque "page needs to be reloaded" error.
+    if _python_too_old() and not args.quiet:
+        console.print(
+            f"[{WARN}]⚠ python {sys.version_info.major}.{sys.version_info.minor} "
+            f"is deprecated by yt-dlp — YouTube downloads may fail.[/]\n"
+            f"[{DIM}]  Upgrade: {_python_hint()}[/]\n"
+            f"[{DIM}]  Other interpreters found: "
+            f"{', '.join(_other_pythons()) or 'none'}[/]")
 
     outdir = Path(args.out).expanduser() if args.out else find_download_dir()
     try:
