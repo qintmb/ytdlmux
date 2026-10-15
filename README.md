@@ -117,8 +117,10 @@ cd ytdlmux
 bash install.sh
 ```
 
-The installer uses Homebrew for `ffmpeg`, pip for the Python libraries, and
-installs `dl` into `~/.local/bin`.
+The installer uses Homebrew for `ffmpeg`, creates a virtualenv at
+`~/.local/share/ytdlmux/venv` for the Python libraries (see
+[PEP 668](#error-externally-managed-environment-pep-668) below for why), and
+installs `dl` into `~/.local/bin` with its shebang pointing at that venv.
 
 #### 3. Make sure `~/.local/bin` is on your PATH
 
@@ -150,7 +152,9 @@ bash install.sh
 ```
 
 The installer picks your package manager (`apt`, `dnf`, or `pacman`) to get
-`ffmpeg`, and installs `dl` into `~/.local/bin`.
+`ffmpeg`, creates a virtualenv at `~/.local/share/ytdlmux/venv` for the Python
+libraries, and installs `dl` into `~/.local/bin` with its shebang pointing at
+that venv.
 
 #### 2. Make sure `~/.local/bin` is on your PATH
 
@@ -419,6 +423,32 @@ winget install Python.Python.3.12   # Windows
 
 Then make sure `dl` runs under it (e.g. `python3.12 -m pip install -U yt-dlp rich
 prompt_toolkit`), or point `dl`'s shebang at the newer interpreter.
+
+**`error: externally-managed-environment` (PEP 668)**
+Homebrew (macOS) and Debian/Ubuntu mark their Python as *externally managed* and
+refuse system-wide `pip install`. This is a deliberate safety feature.
+
+> ⚠️ **Do not use `--break-system-packages`.** It can break your Homebrew Python
+> and is not needed here.
+
+Use a virtualenv instead:
+
+```bash
+python3 -m venv ~/.local/share/ytdlmux/venv
+~/.local/share/ytdlmux/venv/bin/pip install -U yt-dlp rich prompt_toolkit
+```
+
+Then run `dl` with that interpreter. The installer does this for you
+automatically on macOS and Linux, and points the `dl` shebang at the venv so it
+never falls back to a system Python:
+
+```bash
+bash install.sh
+head -1 "$(command -v dl)"     # -> #!.../ytdlmux/venv/bin/python
+```
+
+This also sidesteps the old-Python problem above, because the venv pins a
+modern interpreter.
 
 **Merging video+audio fails**
 `ffmpeg` is missing:

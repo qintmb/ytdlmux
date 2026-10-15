@@ -35,9 +35,21 @@ pick_bin_dir() {
         printf '%s\n' "${PREFIX:-/data/data/com.termux/files/usr}/bin"
         return
     fi
-    # Desktop: prefer a user-writable dir that is already on PATH.
+    # Desktop: strongly prefer the per-user dir. Writing to /usr/local/bin
+    # needs elevated rights on most setups and would let one user's install
+    # shadow the "dl" every other user gets -- not what a personal tool wants.
     local d
-    for d in "$HOME/.local/bin" "/usr/local/bin" "$HOME/bin"; do
+    for d in "$HOME/.local/bin" "$HOME/bin"; do
+        case ":$PATH:" in
+            *":$d:"*) printf '%s\n' "$d"; return ;;
+        esac
+    done
+    for d in "$HOME/.local/bin" "$HOME/bin"; do
+        [ -d "$d" ] && printf '%s\n' "$d" && return
+    done
+    # Only reach for a shared location when the user has no writable dir of
+    # their own AND it is genuinely writable without sudo.
+    for d in "/usr/local/bin" "/opt/homebrew/bin"; do
         case ":$PATH:" in
             *":$d:"*) [ -w "$d" ] && { printf '%s\n' "$d"; return; } ;;
         esac
@@ -102,16 +114,71 @@ install_deps() {
 install_deps
 
 # --- 2. python libraries ---------------------------------------------------
-c "==> Installing Python libraries (yt-dlp, rich, prompt_toolkit)…"
-PY="python3"
-command -v python3 >/dev/null 2>&1 || PY="python"
-if "$PY" -m pip install -U --user yt-dlp rich prompt_toolkit >/dev/null 2>&1; then
-    ok "yt-dlp / rich / prompt_toolkit ready"
-elif "$PY" -m pip install -U yt-dlp rich prompt_toolkit >/dev/null 2>&1; then
-    ok "yt-dlp / rich / prompt_toolkit ready (system-wide)"
+# Homebrew and Debian mark their Python "externally managed" (PEP 668) and
+# refuse system-wide installs -- deliberately, to protect the OS Python. The
+# right answer is a dedicated virtualenv, which also keeps dl on a modern
+# interpreter instead of whatever python3 happens to be first on PATH.
+#
+# Why this matters: on macOS the fallback python3 is often Xcode's 3.9, and
+# yt-dlp no longer works well there for YouTube extraction
+# ("The page needs to be reloaded"). A venv pins a good interpreter.
+VENV_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ytdlmux/venv"
+
+pick_python() {
+    # Prefer a modern interpreter (>= 3.10, required by current yt-dlp).
+    for cand in python3.14 python3.13 python3.12 python3.11 python3 python; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            if "$cand" -c 'import sys; sys.exit(0 if sys.version_info>=(3,10) else 1)' 2>/dev/null; then
+                printf '%s\n' "$cand"; return 0
+            fi
+        fi
+    done
+    command -v python3 >/dev/null 2>&1 && { printf 'python3\n'; return 0; }
+    command -v python  >/dev/null 2>&1 && { printf 'python\n';  return 0; }
+    return 1
+}
+
+if [ "$OS" = "termux" ]; then
+    # Termux is not PEP 668 managed; a plain user install is lighter.
+    c "==> Installing Python libraries (yt-dlp, rich, prompt_toolkit)…"
+    PY="$(pick_python)" || { er "Python not found. Run: pkg install python"; exit 1; }
+    if "$PY" -m pip install -U yt-dlp rich prompt_toolkit >/dev/null 2>&1; then
+        ok "yt-dlp / rich / prompt_toolkit ready  ($("$PY" -V 2>&1))"
+        DL_PYTHON="$PY"
+    else
+        er "pip install failed. Try: $PY -m pip install -U yt-dlp rich prompt_toolkit"
+        exit 1
+    fi
 else
-    er "pip install failed. Try: $PY -m pip install -U yt-dlp rich prompt_toolkit"
-    exit 1
+    PY="$(pick_python)" || { er "Python 3 not found. Install Python 3.10+ first."; exit 1; }
+    c "==> Creating virtualenv for ytdlmux…"
+    c "    interpreter: $("$PY" -V 2>&1)   ($(command -v "$PY"))"
+
+    # Reuse an existing venv so re-running is cheap, but only when it still
+    # points at a usable (>= 3.10) interpreter.
+    if [ -x "$VENV_DIR/bin/python" ] \
+       && "$VENV_DIR/bin/python" -c 'import sys; sys.exit(0 if sys.version_info>=(3,10) else 1)' 2>/dev/null; then
+        ok "Existing venv reused: $VENV_DIR"
+    else
+        rm -rf "$VENV_DIR" 2>/dev/null || true
+        if ! "$PY" -m venv "$VENV_DIR" >/dev/null 2>&1; then
+            er "Could not create a virtualenv at $VENV_DIR"
+            er "Hint: install python3-venv (Debian/Ubuntu) and re-run."
+            exit 1
+        fi
+        ok "Virtualenv created: $VENV_DIR"
+    fi
+
+    c "==> Installing yt-dlp, rich, prompt_toolkit into the venv…"
+    "$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
+    if "$VENV_DIR/bin/python" -m pip install --quiet -U yt-dlp rich prompt_toolkit >/dev/null 2>&1; then
+        ok "yt-dlp / rich / prompt_toolkit ready  ($("$VENV_DIR/bin/python" -V 2>&1))"
+    else
+        er "pip install into the venv failed. Try:"
+        er "  $VENV_DIR/bin/pip install -U yt-dlp rich prompt_toolkit"
+        exit 1
+    fi
+    DL_PYTHON="$VENV_DIR/bin/python"
 fi
 
 # --- 3. platform-specific storage setup ------------------------------------
@@ -152,10 +219,40 @@ if [ ! -d "$BIN_DIR" ]; then
     mkdir -p "$BIN_DIR" 2>/dev/null || { er "Cannot create $BIN_DIR"; exit 1; }
 fi
 
-install -m 755 "$SOURCE" "$TARGET" 2>/dev/null \
-    || { cp "$SOURCE" "$TARGET" && chmod 755 "$TARGET"; } \
-    || { er "Cannot write $TARGET (try: sudo bash install.sh)"; exit 1; }
-ok "Installed: $TARGET"
+# Write dl with a shebang pointing at the interpreter that actually has the
+# dependencies. Otherwise `./dl` falls back to /usr/bin/env python3 -- on macOS
+# the outdated Xcode 3.9 -- and YouTube extraction fails.
+INTERP=""
+if [ -n "${DL_PYTHON:-}" ] && command -v "$DL_PYTHON" >/dev/null 2>&1; then
+    INTERP="$(command -v "$DL_PYTHON")"
+fi
+
+if [ -n "$INTERP" ]; then
+    if SOURCE="$SOURCE" TARGET="$TARGET" INTERP="$INTERP" python3 - <<'PYEOF'
+import os
+src, dst = os.environ["SOURCE"], os.environ["TARGET"]
+lines = open(src, encoding="utf-8").read().split("\n")
+if lines and lines[0].startswith("#!"):
+    lines[0] = "#!" + os.environ["INTERP"]
+open(dst, "w", encoding="utf-8").write("\n".join(lines))
+PYEOF
+    then
+        chmod 755 "$TARGET"
+        ok "Installed: $TARGET"
+        ok "  shebang -> $INTERP"
+    else
+        install -m 755 "$SOURCE" "$TARGET" 2>/dev/null \
+            || { cp "$SOURCE" "$TARGET" && chmod 755 "$TARGET"; } \
+            || { er "Cannot write $TARGET (try: sudo bash install.sh)"; exit 1; }
+        wr "Installed, but could not retarget the shebang — dl may use the wrong python"
+        ok "Installed: $TARGET"
+    fi
+else
+    install -m 755 "$SOURCE" "$TARGET" 2>/dev/null \
+        || { cp "$SOURCE" "$TARGET" && chmod 755 "$TARGET"; } \
+        || { er "Cannot write $TARGET (try: sudo bash install.sh)"; exit 1; }
+    ok "Installed: $TARGET"
+fi
 
 # --- 5. PATH hint ----------------------------------------------------------
 case ":$PATH:" in
