@@ -940,8 +940,10 @@ class Downloader:
             "progress_hooks": [self.hook],
             "postprocessor_hooks": [self.pp_hook],
             "consoletitle": False,
-            "trim_file_name": 200,
-            "windowsfilenames": False,
+            "trim_file_name": 120,
+            "windowsfilenames": True,
+            # Android client gets HTTP 403 mid-download on some videos; web_safari is stable.
+            "extractor_args": {"youtube": {"player_client": ["default", "web_safari"]}},
         }
         rt = js_runtimes()
         if rt:
