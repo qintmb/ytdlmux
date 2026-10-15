@@ -1,18 +1,24 @@
 # ytdlmux
 
-**Video/audio downloader for Termux on Android with an interactive TUI.**
+**Video/audio downloader with an interactive TUI — for Termux on Android,
+macOS, Linux, and Windows.**
 
 `ytdlmux` wraps [yt-dlp](https://github.com/yt-dlp/yt-dlp) in a clean terminal
 interface: a resolution picker, progress bar, download speed, ETA, and a format
-list. Downloads are saved to **`DCIM/ytdlmux`** on Android storage and registered
-with the media scanner — so your videos **show up right in the phone's Gallery
-app**, instead of hiding inside Termux's private folder.
+list. Downloads land in the folder your OS actually shows in its gallery app:
+
+| Platform | Default folder |
+|---|---|
+| Android (Termux) | `/storage/emulated/0/DCIM/ytdlmux` → Gallery app |
+| macOS | `~/Movies/ytdlmux` → Photos / QuickTime |
+| Linux | `~/Videos/ytdlmux` (respects `XDG_VIDEOS_DIR`) |
+| Windows | `%USERPROFILE%\Videos\ytdlmux` → Videos library |
 
 The command is short: **`dl`**.
 
 ```
   ⬇  ytdlmux   yt-dlp TUI downloader
-  Target   /storage/emulated/0/DCIM/ytdlmux
+  Target   /Users/you/Movies/ytdlmux
   Format   1080p mp4
   Done     1 file
  ─────────────────────────────────────────────────────────────
@@ -27,21 +33,31 @@ The command is short: **`dl`**.
 |---|---|
 | **Interactive TUI** | Pick resolution/format from a menu instead of typing long flags |
 | **Live progress bar** | Real-time bar, speed, ETA, and elapsed time |
-| **Saves to Gallery** | Output to `DCIM/ytdlmux` + automatic Android media scan |
+| **Saves to your gallery** | Writes to the OS video/DCIM folder and auto-registers with the media scanner |
 | **Best video + audio** | Automatically merges the best streams (requires `ffmpeg`) |
 | **MP3 320k audio** | Convert audio with `-a` |
 | **Playlists** | Download a whole playlist with `-p` |
-| **Subtitles** | Download & embed Indonesian/English subtitles with `-s` |
+| **Subtitles** | Download & embed subtitles with `-s` |
 | **Clipboard** | Run `dl` with no arguments to grab the URL from the clipboard |
-| **Notifications** | Android notification when a download finishes (Termux:API) |
-| **Wake lock** | Keeps the CPU awake while a download is running |
-| **Safe fallback** | Still works even without Termux:API installed |
+| **Notifications** | Native notification when a download finishes |
+| **Self-update** | `dl -U` updates both yt-dlp and `ytdlmux` itself |
+| **Cross-platform** | Termux/Android, macOS, Linux, WSL, and Windows |
+| **Safe fallback** | Works even without optional extras like Termux:API or `notify-send` |
 
 ---
 
-## Installing on Termux (Android)
+## Installation
 
-### 1. Install Termux
+Pick your platform. All of them end with the same `dl` command.
+
+`install.sh` auto-detects the platform and installs to the right place
+(`$PREFIX/bin` on Termux, `~/.local/bin` on desktop).
+
+---
+
+### Android — Termux
+
+#### 1. Install Termux
 
 Install **Termux** from **F-Droid** (recommended) or GitHub Releases:
 
@@ -50,60 +66,160 @@ Install **Termux** from **F-Droid** (recommended) or GitHub Releases:
 > ⚠️ Do **not** use Termux from Google Play — that version is outdated and
 > `pkg install` often fails.
 
-### 2. Grant storage access
+#### 2. Grant storage access
 
 ```bash
 termux-setup-storage
 ```
 
-Approve the permission dialog that appears. This is required, because the `DCIM`
-folder lives in Android's shared storage.
+Approve the permission dialog. This is required, because `DCIM` lives in
+Android's shared storage.
 
-### 3. Install dependencies
-
-```bash
-pkg update -y && pkg upgrade -y
-pkg install -y python ffmpeg nodejs git
-pip install -U yt-dlp rich prompt_toolkit
-```
-
-Details:
-
-- `python` — runs the script
-- `ffmpeg` — merges video+audio & converts to MP3
-- `nodejs` — JavaScript runtime, so yt-dlp keeps supporting YouTube extraction
-- `rich` — the TUI display
-- `prompt_toolkit` — the resolution picker menu
-
-### 4. Get this project
+#### 3. Clone and install
 
 ```bash
+pkg install -y git
 git clone https://github.com/qintmb/ytdlmux.git
 cd ytdlmux
-```
-
-### 5. Install the `dl` command
-
-Automatic:
-
-```bash
 bash install.sh
 ```
 
-Or manual:
+Or manually:
 
 ```bash
+pkg update -y && pkg upgrade -y
+pkg install -y python ffmpeg nodejs
+pip install -U yt-dlp rich prompt_toolkit
 install -m 755 dl "$PREFIX/bin/dl"
-mkdir -p ~/storage/dcim/ytdlmux
 ```
 
-### 6. Done — try a download
+#### 4. Try it
 
 ```bash
 dl -y "https://youtu.be/VIDEO_ID"
 ```
 
-The file will appear in **DCIM/ytdlmux** and show up in the Gallery app.
+The file appears in **DCIM/ytdlmux** and shows up in the Gallery app.
+
+---
+
+### macOS
+
+#### 1. Install Homebrew (if you don't have it)
+
+- <https://brew.sh>
+
+#### 2. Clone and install
+
+```bash
+git clone https://github.com/qintmb/ytdlmux.git
+cd ytdlmux
+bash install.sh
+```
+
+The installer uses Homebrew for `ffmpeg`, pip for the Python libraries, and
+installs `dl` into `~/.local/bin`.
+
+#### 3. Make sure `~/.local/bin` is on your PATH
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+```
+
+> On macOS the default shell is zsh, so use `~/.zshrc`. Use `~/.bashrc` only if
+> you run bash.
+
+#### 4. Try it
+
+```bash
+dl -y "https://youtu.be/VIDEO_ID"
+```
+
+Files land in `~/Movies/ytdlmux`.
+
+---
+
+### Linux
+
+#### 1. Clone and install
+
+```bash
+git clone https://github.com/qintmb/ytdlmux.git
+cd ytdlmux
+bash install.sh
+```
+
+The installer picks your package manager (`apt`, `dnf`, or `pacman`) to get
+`ffmpeg`, and installs `dl` into `~/.local/bin`.
+
+#### 2. Make sure `~/.local/bin` is on your PATH
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+#### 3. Optional: clipboard and notifications
+
+```bash
+# Wayland
+sudo apt install wl-clipboard libnotify-bin
+# X11
+sudo apt install xclip libnotify-bin
+```
+
+Without these, `dl URL` still works — only the bare `dl` clipboard shortcut and
+desktop notifications are skipped.
+
+#### 4. Try it
+
+```bash
+dl -y "https://youtu.be/VIDEO_ID"
+```
+
+Files land in `~/Videos/ytdlmux` (or `$XDG_VIDEOS_DIR/ytdlmux` if set).
+
+---
+
+### Windows
+
+Use **Git Bash** (bundled with [Git for Windows](https://git-scm.com/download/win))
+or **WSL**.
+
+#### Option A — Git Bash
+
+```bash
+git clone https://github.com/qintmb/ytdlmux.git
+cd ytdlmux
+bash install.sh
+```
+
+`dl` is installed to `~/.local/bin`. Add it to your PATH (Git Bash):
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+For `ffmpeg`, either let the installer use `winget`:
+
+```powershell
+winget install Gyan.FFmpeg
+```
+
+…or download it from <https://www.gyan.dev/ffmpeg/builds/> and add its `bin`
+folder to PATH.
+
+#### Option B — WSL (recommended for the smoothest experience)
+
+Follow the **Linux** instructions above inside your WSL distro. Files land in the
+WSL home directory; use `-o /mnt/c/Users/you/Videos` to save them on Windows.
+
+#### Try it
+
+```bash
+dl -y "https://youtu.be/VIDEO_ID"
+```
+
+Files land in `%USERPROFILE%\Videos\ytdlmux`.
 
 ---
 
@@ -117,12 +233,12 @@ dl -l <url>                 # list the available formats
 dl -f "137+140" <url>       # manual yt-dlp format selector
 dl -p <url>                 # download the whole playlist
 dl --playlist-items 1-5 <url>   # only items 1–5 of the playlist
-dl -s <url>                 # download + embed subtitles (id/en)
-dl -o ~/storage/movies <url>    # change the target folder
+dl -s <url>                 # download + embed subtitles
+dl -o ~/Videos <url>        # change the target folder
 dl -x socks5://127.0.0.1:1080 <url>  # through a proxy
 dl --limit-rate 500000 <url>     # limit speed (bytes/second)
-dl                          # grab the URL from the Android clipboard
-dl -U                       # update yt-dlp
+dl                          # grab the URL from the clipboard
+dl -U                       # update yt-dlp + ytdlmux
 dl -V                       # check the version
 ```
 
@@ -138,41 +254,68 @@ dl -a "https://youtu.be/dQw4w9WgXcQ"
 # Download a full playlist, auto-pick quality
 dl -y -p "https://youtube.com/playlist?list=XXXX"
 
-# Copy a URL in the phone's browser, then just run:
+# Copy a URL in your browser, then just run:
 dl
 ```
+
+### Updating
+
+```bash
+dl -U
+```
+
+This does two things:
+
+1. Updates **yt-dlp** (which you need regularly — YouTube changes often).
+2. Checks the latest **ytdlmux release tag** on GitHub and updates the `dl`
+   script itself when a newer version exists.
+
+The script is replaced atomically and keeps its executable bit. If `dl` is
+installed somewhere read-only (like `/usr/bin`), it tells you to re-run with
+elevated rights instead of failing silently. Offline, it simply skips the script
+update.
 
 ---
 
 ## Where Are Files Saved?
 
-By default: **`/storage/emulated/0/DCIM/ytdlmux`**
+The default is the first writable folder in this list:
 
-The `DCIM` folder is Android's standard gallery location, so downloads are
-indexed directly by the Gallery app, Google Photos, and other video players.
+| Platform | Candidate folders, in order |
+|---|---|
+| Android | `/storage/emulated/0/DCIM/ytdlmux`, `/sdcard/DCIM/ytdlmux`, `~/storage/dcim/ytdlmux`, `~/storage/downloads`, `~/Downloads` |
+| macOS | `~/Movies/ytdlmux`, `~/Downloads` |
+| Linux | `$XDG_VIDEOS_DIR/ytdlmux`, `~/Videos/ytdlmux`, `~/Downloads` |
+| Windows | `%USERPROFILE%\Videos\ytdlmux`, `%USERPROFILE%\Downloads` |
 
-The script automatically calls the media scanner once a download finishes. If a
-file doesn't show up in the gallery, scan manually:
+An existing gallery/video folder always wins. If none exists, `ytdlmux` creates
+the preferred one rather than quietly filling `~/Downloads`.
+
+To use a different folder, pass `-o`:
+
+```bash
+dl -o ~/Desktop/videos "https://youtu.be/XXXX"
+```
+
+### Gallery registration
+
+On **Android**, the script calls the media scanner after each download so files
+appear in the Gallery app. If a file does not show up, scan manually:
 
 ```bash
 termux-media-scan -r ~/storage/dcim/ytdlmux
 ```
 
-The folders tried, in order (the first writable one is used):
-
-1. `/storage/emulated/0/DCIM/ytdlmux`
-2. `/sdcard/DCIM/ytdlmux`
-3. `~/storage/dcim/ytdlmux`
-4. `~/storage/downloads`
-5. `~/Downloads`
-
-To use a different folder, pass `-o`.
+On **macOS, Linux, and Windows** no scan is needed — those video folders are
+indexed live by the OS.
 
 ---
 
-## Termux:API (optional)
+## Platform Extras
 
-A few extra features need the **Termux:API** app:
+### Android — Termux:API (optional)
+
+A few extras need the **Termux:API** app:
 
 - grabbing a URL from the clipboard (`dl` with no arguments)
 - notifications when a download finishes
@@ -186,18 +329,34 @@ Then install the **Termux:API** app from F-Droid:
 
 - <https://f-droid.org/packages/com.termux.api/>
 
-Without Termux:API, `ytdlmux` still works normally: the automatic media scan uses
-Android's built-in `am broadcast`, and the clipboard/notification features are
-skipped.
+Without it, `ytdlmux` still works: the media scan falls back to Android's
+built-in `am broadcast`, and the clipboard/notification features are skipped.
+
+### Desktop — clipboard and notifications
+
+| Platform | Clipboard | Notifications |
+|---|---|---|
+| macOS | `pbpaste` (built in) | `osascript` (built in) |
+| Linux | `wl-paste` (Wayland), `xclip`/`xsel` (X11) | `notify-send` (libnotify) |
+| Windows | PowerShell `Get-Clipboard` (built in) | PowerShell `NotifyIcon` balloon (built in) |
+
+All of these are optional. When a tool is missing, `dl` degrades gracefully and
+tells you to pass a URL explicitly.
 
 ---
 
 ## Troubleshooting
 
-**`ytdlmux: command not found`**
-Make sure `$PREFIX/bin` is on your `PATH`:
+**`dl: command not found`**
+`~/.local/bin` (or `$PREFIX/bin` on Termux) is not on your `PATH`.
 
 ```bash
+# Linux / macOS / Git Bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+```bash
+# Termux
 echo 'export PATH="$PREFIX/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 ```
 
@@ -209,13 +368,24 @@ dl -U
 ```
 
 **Merging video+audio fails**
-`ffmpeg` is not installed:
+`ffmpeg` is missing:
 
 ```bash
-pkg install -y ffmpeg
+pkg install ffmpeg          # Termux
+brew install ffmpeg         # macOS
+sudo apt install ffmpeg     # Debian/Ubuntu
+winget install Gyan.FFmpeg  # Windows
 ```
 
-**File doesn't show up in the gallery**
+**`dl -U` says it cannot write the script**
+`dl` is installed in a read-only location. Re-run the update with elevated
+rights, or install to a user-writable folder:
+
+```bash
+install -m 755 dl ~/.local/bin/dl
+```
+
+**File doesn't show up in the gallery (Android)**
 Run a manual scan, then reopen the Gallery app:
 
 ```bash
@@ -225,9 +395,12 @@ termux-media-scan -r ~/storage/dcim/ytdlmux
 **Storage permission is lost after a Termux update**
 Run `termux-setup-storage` again.
 
-**Downloads feel slow**
+**Downloads feel slow on Android**
 Android throttles background processes. Disable battery optimization for
 Termux under *Settings → Apps → Termux → Battery*.
+
+**Bare `dl` does nothing**
+No clipboard tool was found. Pass the URL directly: `dl <url>`.
 
 ---
 
@@ -236,7 +409,7 @@ Termux under *Settings → Apps → Termux → Battery*.
 ```
 ytdlmux/
 ├── dl           # main script (Python), installed as the `dl` command
-├── install.sh   # automatic installer for Termux
+├── install.sh   # cross-platform installer (Termux/macOS/Linux/Windows)
 ├── README.md    # this documentation
 ├── LICENSE      # MIT license
 └── .gitignore
@@ -246,11 +419,12 @@ ytdlmux/
 
 ## Requirements
 
-- Termux (F-Droid) + Android 7.0 or newer
-- Python 3.8+
+- Python 3.8+ (3.10+ recommended)
 - `yt-dlp`, `rich`, `prompt_toolkit`
 - `ffmpeg` (for merging video+audio & MP3 conversion)
 - `nodejs` (recommended, for YouTube extraction)
+- Termux:API *(Android, optional)*
+- `wl-clipboard` / `xclip` / `xsel` and `libnotify` *(Linux, optional)*
 
 ---
 

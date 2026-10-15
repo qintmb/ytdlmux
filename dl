@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DLMUX (ytdlmux) — modern yt-dlp TUI downloader for Termux / Android.
+DLMUX (ytdlmux) — modern yt-dlp TUI downloader for Termux / Android,
+plus macOS, Linux, and Windows.
 
 Usage:
-    dl <url> [<url> ...]        pick resolution, save to DCIM/ytdlmux (gallery)
+    dl <url> [<url> ...]        pick resolution, save to the gallery folder
     dl -a <url>                 audio only (MP3 320k)
     dl -y <url>                 skip picker, best quality
     dl -l <url>                 list available formats
     dl -f "137+140" <url>       explicit yt-dlp format selector
     dl -p <url>                 download whole playlist
-    dl                          URL taken from Android clipboard
+    dl                          URL taken from the clipboard
+    dl -U                       update yt-dlp and this script
 
-Downloads are written to /storage/emulated/0/DCIM/ytdlmux and then handed to
+On Android downloads land in /storage/emulated/0/DCIM/ytdlmux and are handed to
 Android's media scanner, so finished files show up in the phone's Gallery app.
+On desktop they land in a sensible per-OS video folder (see DOWNLOAD_DIRS).
 """
 
 from __future__ import annotations
@@ -23,57 +26,165 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
 from pathlib import Path
+
+# --------------------------------------------------------------------------- #
+#  version / project
+# --------------------------------------------------------------------------- #
+
+VERSION = "1.1"
+
+GITHUB_REPO = "qintmb/ytdlmux"
+GITHUB_RAW = f"https://raw.githubusercontent.com/{GITHUB_REPO}"
+GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+
+# --------------------------------------------------------------------------- #
+#  platform detection
+# --------------------------------------------------------------------------- #
+
+IS_ANDROID = (sys.platform == "android"
+              or "ANDROID_ROOT" in os.environ
+              or "com.termux" in os.environ.get("PREFIX", "")
+              or os.path.isdir("/data/data/com.termux/files/usr"))
+IS_MAC = (sys.platform == "darwin" and not IS_ANDROID)
+IS_WIN = (os.name == "nt" or sys.platform.startswith("win"))
+IS_LINUX = not (IS_MAC or IS_WIN or IS_ANDROID)
 
 # --------------------------------------------------------------------------- #
 #  paths / helpers
 # --------------------------------------------------------------------------- #
 
-# Android's gallery lives under DCIM. Everything we download goes into
-# DCIM/ytdlmux so the phone's Gallery app picks it up automatically.
+# Android's gallery lives under DCIM; desktops get a per-OS video folder.
 GALLERY_SUBDIR = "ytdlmux"
 
+_desktop_dirs: list[Path] = []
+if IS_ANDROID:
+    pass                       # Android uses the DCIM paths below, not ~/Videos
+elif IS_MAC:
+    _desktop_dirs.append(Path.home() / "Movies" / GALLERY_SUBDIR)
+else:
+    # Linux / BSD / Windows: XDG user dir when set, else the spec default.
+    _xdg = os.environ.get("XDG_VIDEOS_DIR")
+    if _xdg:
+        _desktop_dirs.append(Path(_xdg).expanduser() / GALLERY_SUBDIR)
+    _desktop_dirs.append(Path.home() / "Videos" / GALLERY_SUBDIR)
+
+# Android paths only make sense on Android; including them everywhere would let
+# e.g. a macOS HOME grow a stray ~/storage/dcim folder that outranks ~/Movies.
+if IS_ANDROID:
+    _android_dirs = [
+        Path("/storage/emulated/0/DCIM") / GALLERY_SUBDIR,  # shared DCIM (gallery)
+        Path("/sdcard/DCIM") / GALLERY_SUBDIR,              # alias of the above
+        Path.home() / "storage" / "dcim" / GALLERY_SUBDIR,  # Termux symlink
+    ]
+    _fallback_dirs = [
+        Path.home() / "storage" / "downloads",
+        Path.home() / "Downloads",
+    ]
+else:
+    _android_dirs = []
+    _fallback_dirs = [Path.home() / "Downloads"]
+
 DOWNLOAD_DIRS = [
-    Path("/storage/emulated/0/DCIM") / GALLERY_SUBDIR,   # Android DCIM (gallery)
-    Path("/sdcard/DCIM") / GALLERY_SUBDIR,
-    Path.home() / "storage" / "dcim" / GALLERY_SUBDIR,   # Termux symlink fallback
-    Path.home() / "storage" / "downloads",               # last resort
-    Path.home() / "Downloads",
+    *_android_dirs,
+    *_desktop_dirs,        # macOS ~/Movies, Linux/Windows ~/Videos
+    *_fallback_dirs,       # last resort
 ]
+
+# Folders that count as "the gallery" for the media-scanner path. On Android
+# that is DCIM (Gallery app); on desktop it is the video folder (Photos/TV app).
+GALLERY_BASES = list(_android_dirs) + ([] if IS_ANDROID else list(_desktop_dirs))
+
+
+def _norm(path) -> Path:
+    """Absolute, symlink-free best effort - tolerates not-yet-created paths.
+
+    `Path.resolve()` on a missing path is fine on POSIX but raises on Windows
+    and can produce different spellings across platforms (e.g. /tmp vs
+    /private/tmp on macOS), which would make directory comparisons unreliable.
+    """
+    try:
+        return Path(path).expanduser().resolve()
+    except OSError:
+        try:
+            return Path(os.path.abspath(os.path.expanduser(str(path))))
+        except OSError:
+            return Path(path)
 
 
 def is_gallery_dir(path) -> bool:
-    """True if `path` is (inside) the DCIM/ytdlmux gallery folder."""
-    try:
-        p = Path(path).resolve()
-    except OSError:
-        return False
-    for base in DOWNLOAD_DIRS[:3]:
-        try:
-            b = base.resolve()
-        except OSError:
-            continue
+    """True if `path` is (inside) a system gallery/video folder."""
+    p = _norm(path)
+    for base in GALLERY_BASES:
+        b = _norm(base)
         if p == b or b in p.parents:
             return True
     return False
 
 
+def _writable(path) -> bool:
+    """Writable check that also accepts a folder we could create ourselves."""
+    try:
+        if path.is_dir():
+            return os.access(path, os.W_OK)
+    except OSError:
+        return False
+    # Not there yet: usable if the nearest existing ancestor is writable.
+    for parent in path.parents:
+        try:
+            if parent.is_dir():
+                return os.access(parent, os.W_OK)
+        except OSError:
+            continue
+    return False
+
+
 def find_download_dir() -> Path:
-    """First writable destination, preferring the DCIM gallery folder."""
-    for cand in DOWNLOAD_DIRS:
+    """First writable destination, preferring the gallery/video folder.
+
+    The gallery folder is the point of this tool, so an existing one wins
+    outright. Otherwise we create the preferred gallery folder when its parent
+    allows it, and only then fall back to a plain downloads folder - so macOS
+    lands in ~/Movies/ytdlmux and Linux in ~/Videos/ytdlmux rather than
+    quietly filling ~/Downloads.
+    """
+    # 1. An already-existing gallery folder wins.
+    for cand in GALLERY_BASES:
         try:
             if cand.is_dir() and os.access(cand, os.W_OK):
                 return cand
         except OSError:
             continue
-    # DCIM exists but our subfolder does not yet -> create it there.
-    for cand in DOWNLOAD_DIRS[:3]:
+    # 2. Create the preferred gallery folder if we may.
+    for cand in GALLERY_BASES:
+        if not _writable(cand):
+            continue
         try:
             cand.mkdir(parents=True, exist_ok=True)
             if os.access(cand, os.W_OK):
                 return cand
+        except OSError:
+            continue
+    # 3. Any other existing writable folder (-o target, ~/Downloads, ...).
+    for cand in DOWNLOAD_DIRS:
+        if cand in GALLERY_BASES:
+            continue
+        try:
+            if cand.is_dir() and os.access(cand, os.W_OK):
+                return cand
+        except OSError:
+            continue
+    # 4. Nothing suitable: create a fallback folder.
+    for cand in DOWNLOAD_DIRS:
+        if cand in GALLERY_BASES or not _writable(cand):
+            continue
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            return cand
         except OSError:
             continue
     return Path.home()
@@ -704,7 +815,9 @@ class Downloader:
                 body.append(f"   {Path(f).name}\n", style="white")
             body.append(f"   → {self.outdir}\n", style=f"bold {ACCENT}")
             if in_gallery:
-                body.append("   📱 now visible in your phone's gallery", style=DIM)
+                where = ("your phone's gallery" if IS_ANDROID
+                         else "your video folder")
+                body.append(f"   📱 saved to {where}", style=DIM)
             console.print(Panel(body, border_style=OK, box=box.ROUNDED))
         return ok
 
@@ -723,10 +836,58 @@ def termux(cmd: list[str], timeout: int = 6):
         return None
 
 
+def _clipboard_text() -> str | None:
+    """Raw clipboard contents, using whatever the host OS provides.
+
+    Terminal emulators (Ghostty, iTerm, Windows Terminal, ...) have no shared
+    clipboard library, so we shell out to the platform-native tool. Termux:API
+    is tried first on Android; everything else degrades to None, which simply
+    means "no clipboard support" rather than an error.
+    """
+    candidates: list[list[str]] = []
+    if IS_ANDROID:
+        if termux_api_available():
+            candidates.append(["termux-clipboard-get"])
+    elif IS_MAC:
+        candidates.append(["pbpaste"])
+    elif IS_WIN:
+        # PowerShell's Get-Clipboard works on Windows 10+ without extra tools.
+        for shell in ("powershell", "pwsh"):
+            if shutil.which(shell):
+                candidates.append([shell, "-NoProfile", "-Command", "Get-Clipboard"])
+    else:
+        # Wayland first, then X11 — cover whichever session is actually running.
+        if os.environ.get("WAYLAND_DISPLAY"):
+            candidates.extend([["wl-paste", "--no-newline"], ["wl-paste"]])
+        candidates.extend([["xclip", "-selection", "clipboard", "-o"],
+                           ["xsel", "--clipboard", "--output"]])
+
+    for cmd in candidates:
+        out = termux(cmd)
+        if out and out.strip():
+            return out
+    return None
+
+
+def clipboard_supported() -> bool:
+    """Does this environment have any working clipboard reader?
+
+    Used only to tailor the error message — `dl` never fails hard on a missing
+    clipboard, it just asks for an explicit URL instead.
+    """
+    if IS_ANDROID:
+        return termux_api_available() and bool(shutil.which("termux-clipboard-get"))
+    if IS_MAC:
+        return bool(shutil.which("pbpaste"))
+    if IS_WIN:
+        return bool(shutil.which("pwsh") or shutil.which("powershell"))
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+        return True
+    return bool(shutil.which("xclip") or shutil.which("xsel"))
+
+
 def clipboard_url() -> str | None:
-    if not termux_api_available():
-        return None
-    out = termux(["termux-clipboard-get"])
+    out = _clipboard_text()
     if not out:
         return None
     for token in out.split():
@@ -735,20 +896,51 @@ def clipboard_url() -> str | None:
     return None
 
 
+def _notify_cmd(title: str, content: str) -> list[str] | None:
+    """Best available native notification command for this OS, or None."""
+    if IS_ANDROID:
+        if termux_api_available() and shutil.which("termux-notification"):
+            return ["termux-notification", "--title", title,
+                    "--content", content, "--priority", "low"]
+        return None
+    if IS_MAC:
+        # osascript is always present on macOS; escape quotes/backslashes.
+        t = title.replace("\\", "\\\\").replace('"', '\\"')
+        c = content.replace("\\", "\\\\").replace('"', '\\"')
+        return ["osascript", "-e",
+                f'display notification "{c}" with title "{t}"']
+    if IS_WIN:
+        ps = ("[reflection.assembly]::LoadWithPartialName('System.Windows.Forms');"
+              "$n=New-Object System.Windows.Forms.NotifyIcon;"
+              "$n.Icon=[System.Drawing.SystemIcons]::Information;"
+              "$n.Visible=$true;"
+              f"$n.ShowBalloonTip(5000,'{title}','{content}',0);"
+              "Start-Sleep -Seconds 6;$n.Dispose()")
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        return [shell, "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps] if shell else None
+    if shutil.which("notify-send"):
+        return ["notify-send", "-a", "ytdlmux", title, content]
+    return None
+
+
 def notify(title: str, content: str):
-    if not termux_api_available() or not shutil.which("termux-notification"):
+    """Fire a desktop/Android notification (never blocks the TUI)."""
+    cmd = _notify_cmd(title, content)
+    if not cmd:
         return
     threading.Thread(
-        target=lambda: termux(
-            ["termux-notification", "--title", title, "--content", content,
-             "--priority", "low"], timeout=6),
+        target=lambda: termux(cmd, timeout=8),
         daemon=True,
     ).start()
 
 
 def wake_lock(on: bool):
-    """Keep the CPU awake during a download (no-op without Termux:API)."""
-    if not termux_api_available():
+    """Keep the CPU awake during a download (Android only; no-op elsewhere).
+
+    Desktops have no equivalent — and none is needed, since they do not suspend
+    background processes the way Android does.
+    """
+    if not IS_ANDROID or not termux_api_available():
         return
     termux(["termux-wake-lock"] if on else ["termux-wake-unlock"])
 
@@ -783,8 +975,15 @@ def termux_api_available() -> bool:
 
 
 def _scan_paths(paths: list[str]) -> None:
-    """Tell Android's MediaProvider about new files (best effort)."""
+    """Tell the OS about new files so gallery apps pick them up (best effort).
+
+    Android needs an explicit scan. Desktops do not: macOS and Linux video
+    folders and the Windows Videos library are enumerated live by their
+    gallery apps, so this is deliberately a no-op there.
+    """
     if not paths:
+        return
+    if not IS_ANDROID:
         return
     if termux_api_available() and shutil.which("termux-media-scan"):
         termux(["termux-media-scan", *paths], timeout=20)
@@ -806,7 +1005,7 @@ def _scan_paths(paths: list[str]) -> None:
 
 
 def media_scan(paths: list[str], wait: float = 8.0) -> None:
-    """Index downloaded files so the phone's Gallery app shows them.
+    """Index downloaded files so the OS gallery app shows them.
 
     Runs in a daemon thread so a slow/absent media scanner can never stall the
     TUI, but we still join briefly (default 8s) so the usual case finishes
@@ -821,6 +1020,118 @@ def media_scan(paths: list[str], wait: float = 8.0) -> None:
         t.join(timeout=wait)
     except KeyboardInterrupt:                                     # noqa: BLE001
         pass
+
+
+# --------------------------------------------------------------------------- #
+#  self-update (dl -U) — pulls the latest GitHub release, not just yt-dlp
+# --------------------------------------------------------------------------- #
+
+def _http_get(url: str, timeout: int = 15) -> str:
+    req = urllib.request.Request(
+        url, headers={"User-Agent": f"ytdlmux/{VERSION}",
+                      "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def _latest_release_tag() -> str | None:
+    """Newest release tag on GitHub, or None when offline / rate-limited."""
+    try:
+        import json
+        data = json.loads(_http_get(GITHUB_API))
+        return (data.get("tag_name") or "").strip() or None
+    except Exception:                                             # noqa: BLE001
+        return None
+
+
+def _version_key(tag: str) -> tuple:
+    """'v1.2.3' / '1.2.3' -> (1, 2, 3), so tags compare numerically."""
+    parts = tag.lstrip("vV").split(".")
+    out = []
+    for p in parts:
+        num = "".join(ch for ch in p if ch.isdigit())
+        out.append(int(num) if num else 0)
+    return tuple(out) or (0,)
+
+
+def _installed_script_path() -> Path | None:
+    """Real path of this running script (resolving the `dl` on PATH)."""
+    for candidate in (Path(__file__), Path(sys.argv[0])):
+        try:
+            if candidate and candidate.exists():
+                return candidate.resolve()
+        except OSError:
+            continue
+    found = shutil.which("dl")
+    return Path(found).resolve() if found else None
+
+
+def _replace_running_script(path: Path, new_text: str) -> bool:
+    """Atomically swap the installed script, preserving its mode bit."""
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        mode = 0o755
+    try:
+        # Write beside the target so os.replace stays on one filesystem
+        # (a cross-device rename would fail); then swap atomically.
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".dl-", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(new_text)
+        os.chmod(tmp, mode & 0o777)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        # Most likely a read-only location (e.g. /usr/bin); tell the user how
+        # to fix it instead of silently leaving a half-updated script.
+        console.print(f"[{WARN}]⚠ Could not write {path}: {exc}[/]")
+        console.print(f"[{DIM}]  Re-run with elevated rights, or install "
+                      f"somewhere user-writable (e.g. ~/.local/bin).[/]")
+        return False
+
+
+def self_update() -> int:
+    """`dl -U`: update yt-dlp, then this script from the latest release tag."""
+    rc = 0
+
+    console.print(f"[{ACCENT}]Updating yt-dlp…[/]")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"])
+    except Exception as exc:                                      # noqa: BLE001
+        console.print(f"[{WARN}]⚠ yt-dlp update failed: {exc}[/]")
+        rc = 1
+
+    console.print(f"[{ACCENT}]Checking ytdlmux releases…[/]")
+    tag = _latest_release_tag()
+    if not tag:
+        console.print(f"[{DIM}]  Could not reach GitHub — script left as is.[/]")
+        return rc
+
+    if _version_key(tag) <= _version_key(VERSION):
+        console.print(f"[{OK}]✔ ytdlmux already up to date[/] "
+                      f"[{DIM}](v{VERSION}, latest {tag})[/]")
+        return rc
+
+    path = _installed_script_path()
+    if not path:
+        console.print(f"[{WARN}]⚠ Cannot locate the running dl script; skipped.[/]")
+        return rc
+
+    # Prefer the tagged raw file; fall back to main if the tag has no asset.
+    for url in (f"{GITHUB_RAW}/{tag}/dl", f"{GITHUB_RAW}/main/dl"):
+        try:
+            body = _http_get(url, timeout=20)
+        except Exception:                                         # noqa: BLE001
+            continue
+        if not body.lstrip().startswith("#!"):
+            continue                                              # sanity check
+        if _replace_running_script(path, body):
+            console.print(f"[{OK}]✔ ytdlmux updated {VERSION} → {tag}[/]  "
+                          f"[{DIM}]{path}[/]")
+        return rc
+
+    console.print(f"[{WARN}]⚠ Download of {tag} failed; script left unchanged.[/]")
+    return rc
 
 
 # --------------------------------------------------------------------------- #
@@ -858,12 +1169,15 @@ def list_formats(url, args):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="dl",
-        description="yt-dlp TUI downloader for Termux (auto-saves to DCIM/ytdlmux, shows up in the gallery).",
+        description="yt-dlp TUI downloader for Termux/Android, macOS, Linux & Windows "
+                    "(auto-saves to your gallery/video folder).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
                "  dl https://youtube.com/watch?v=xxxx\n"
                "  dl -a https://youtu.be/xxxx\n"
-               "  dl -y -p https://youtube.com/playlist?list=xxxx\n",
+               "  dl -y -p https://youtube.com/playlist?list=xxxx\n"
+               "  dl                       # URL from the clipboard\n"
+               "  dl -U                    # update yt-dlp + ytdlmux\n",
     )
     p.add_argument("urls", nargs="*", help="video/audio URL (empty = take from clipboard)")
     p.add_argument("-a", "--audio", action="store_true", help="audio only, convert to MP3 320k")
@@ -872,11 +1186,12 @@ def parse_args(argv=None):
     p.add_argument("-p", "--playlist", action="store_true", help="download the whole playlist")
     p.add_argument("--playlist-items", help="playlist subset, e.g. 1-5")
     p.add_argument("-l", "--list", action="store_true", help="show the format list then exit")
-    p.add_argument("-o", "--out", help="target folder (default: DCIM/ytdlmux on Android storage)")
+    p.add_argument("-o", "--out", help="target folder (default: the gallery/video folder)")
     p.add_argument("-s", "--sub", action="store_true", help="download + embed subtitles (id/en)")
     p.add_argument("-x", "--proxy", help="proxy, e.g. socks5://127.0.0.1:1080")
     p.add_argument("--limit-rate", type=int, help="speed limit in bytes/second")
-    p.add_argument("-U", "--update", action="store_true", help="update yt-dlp then exit")
+    p.add_argument("-U", "--update", action="store_true",
+                   help="update yt-dlp + ytdlmux from the latest release, then exit")
     p.add_argument("-V", "--version", action="store_true", help="dl version")
     return p.parse_args(argv)
 
@@ -885,14 +1200,18 @@ def main(argv=None) -> int:
     args = parse_args(argv)
 
     if args.version:
-        import yt_dlp
-        console.print(f"ytdlmux 1.0  ·  command: dl  ·  yt-dlp {yt_dlp.version.__version__}")
+        try:
+            import yt_dlp
+            ytv = yt_dlp.version.__version__
+        except ImportError:
+            ytv = "not installed"
+        plat = ("Android/Termux" if IS_ANDROID else
+                "macOS" if IS_MAC else "Windows" if IS_WIN else "Linux")
+        console.print(f"ytdlmux {VERSION}  ·  command: dl  ·  {plat}  ·  yt-dlp {ytv}")
         return 0
 
     if args.update:
-        console.print(f"[{ACCENT}]Updating yt-dlp…[/]")
-        rc = subprocess.call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"])
-        return rc
+        return self_update()
 
     try:
         import yt_dlp  # noqa: F401
@@ -914,9 +1233,12 @@ def main(argv=None) -> int:
             console.print(f"[{DIM}]URL from clipboard:[/] [white]{clip}[/]")
             urls = [clip]
         else:
+            hint = ("copy a URL to the clipboard and just run [bold]dl[/]"
+                    if clipboard_supported() else
+                    "pass a URL: [bold]dl <url>[/]")
             console.print(
-                f"[{WARN}]No URL.[/]\n"
-                f"Use: [bold {ACCENT}]dl <url>[/]   (or copy a URL to the clipboard and just run [bold]dl[/])")
+                f"[{WARN}]No URL given.[/]\n"
+                f"Use: [bold {ACCENT}]dl <url>[/]   (or {hint})")
             return 1
 
     if args.list:
@@ -925,8 +1247,16 @@ def main(argv=None) -> int:
         return 0
 
     if not shutil.which("ffmpeg"):
+        if IS_ANDROID:
+            how = "pkg install ffmpeg"
+        elif IS_MAC:
+            how = "brew install ffmpeg"
+        elif IS_WIN:
+            how = "winget install Gyan.FFmpeg"
+        else:
+            how = "sudo apt install ffmpeg   (or your distro's package manager)"
         console.print(f"[{WARN}]⚠ ffmpeg not found — merging video+audio may fail.[/]\n"
-                      f"[{DIM}]  pkg install ffmpeg[/]")
+                      f"[{DIM}]  {how}[/]")
 
     wake_lock(True)
     rc = 0
