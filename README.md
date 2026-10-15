@@ -264,16 +264,42 @@ dl
 dl -U
 ```
 
-This does two things:
+`dl -U` runs **two independent checks** and updates whichever is behind:
 
-1. Updates **yt-dlp** (which you need regularly — YouTube changes often).
-2. Checks the latest **ytdlmux release tag** on GitHub and updates the `dl`
-   script itself when a newer version exists.
+```
+Checking for updates  (ytdlmux v1.1)
+  [1/2] yt-dlp       installed: 2025.10.14
+                 latest:    2026.8.19
+       → updating yt-dlp…
+       ✔ yt-dlp 2025.10.14 → 2026.8.19
+  [2/2] ytdlmux      installed: v1.1
+                 latest:    v1.2
+       → downloading v1.2…
+       ✔ ytdlmux updated v1.1 → v1.2
+         ~/.local/bin/dl
+         restart dl to use the new version
 
-The script is replaced atomically and keeps its executable bit. If `dl` is
-installed somewhere read-only (like `/usr/bin`), it tells you to re-run with
-elevated rights instead of failing silently. Offline, it simply skips the script
-update.
+Update complete.
+```
+
+| Check | Compared against | Action |
+|---|---|---|
+| **1. yt-dlp** | latest on PyPI | upgraded via pip |
+| **2. ytdlmux** | latest GitHub **release tag** | the `dl` script is replaced in place |
+
+Notes:
+
+- **No re-clone needed.** Only the `dl` script is downloaded, so a git checkout
+  at any commit updates cleanly.
+- The release tag is tried first and `main` is used as a fallback, so a freshly
+  cut release — or a tag without the file attached — still upgrades.
+- The script is replaced **atomically** and keeps its executable bit. A bad
+  download (HTML error page, truncated body) is rejected before it can overwrite
+  a working install.
+- If `dl` is installed somewhere read-only (like `/usr/bin`), it tells you to
+  re-run with elevated rights instead of failing silently.
+- Offline or rate-limited by GitHub, it reports that and leaves the script alone.
+- Restart `dl` afterwards to pick up the new version.
 
 ---
 
@@ -367,6 +393,33 @@ yt-dlp needs frequent updates:
 dl -U
 ```
 
+**`ERROR: [youtube] ...: The page needs to be reloaded.`**
+This is almost always an **old Python**, not a YouTube problem. yt-dlp deprecated
+Python 3.9, and modern extraction paths break there. Same URL, same options:
+
+| Interpreter | yt-dlp | Result |
+|---|---|---|
+| python3.9 | 2025.10.14 | ❌ The page needs to be reloaded |
+| python3.14 | 2026.08.19 | ✅ extracts and downloads |
+
+Check what you are running:
+
+```bash
+dl -V
+```
+
+If it warns about an old Python, upgrade and reinstall yt-dlp for the new one:
+
+```bash
+brew install python@3.12     # macOS
+sudo apt install python3.12  # Debian/Ubuntu
+pkg install python           # Termux
+winget install Python.Python.3.12   # Windows
+```
+
+Then make sure `dl` runs under it (e.g. `python3.12 -m pip install -U yt-dlp rich
+prompt_toolkit`), or point `dl`'s shebang at the newer interpreter.
+
 **Merging video+audio fails**
 `ffmpeg` is missing:
 
@@ -419,7 +472,8 @@ ytdlmux/
 
 ## Requirements
 
-- Python 3.8+ (3.10+ recommended)
+- **Python 3.10+** (3.8/3.9 still run, but yt-dlp has deprecated them and
+  YouTube extraction can fail — see below)
 - `yt-dlp`, `rich`, `prompt_toolkit`
 - `ffmpeg` (for merging video+audio & MP3 conversion)
 - `nodejs` (recommended, for YouTube extraction)
