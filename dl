@@ -36,7 +36,7 @@ from pathlib import Path
 #  version / project
 # --------------------------------------------------------------------------- #
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 GITHUB_REPO = "qintmb/ytdlmux"
 GITHUB_RAW = f"https://raw.githubusercontent.com/{GITHUB_REPO}"
@@ -1077,12 +1077,48 @@ def _installed_script_path() -> Path | None:
     return Path(found).resolve() if found else None
 
 
+def _keep_shebang(path: Path, new_text: str) -> str:
+    """Carry the installed script's interpreter over to the downloaded body.
+
+    This matters for venv installs: the local shebang points at the venv's
+    python (which has rich/prompt_toolkit/yt-dlp). The upstream file ships a
+    generic `#!/usr/bin/env python3`, so blindly writing it would silently move
+    the user back to a system interpreter — on macOS that is Python 3.9, whose
+    yt-dlp cannot extract YouTube any more. Installation-specific first lines
+    therefore win over the upstream default.
+    """
+    try:
+        current = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return new_text
+    old_shebang = current.split("\n", 1)[0].strip()
+    if not old_shebang.startswith("#!"):
+        return new_text
+
+    lines = new_text.split("\n")
+    if not lines or not lines[0].startswith("#!"):
+        return new_text
+
+    # If upstream already points at a specific interpreter, trust it; only
+    # replace the generic `env python3` form, which is the one that loses the
+    # venv/version. A pinned /usr/bin/python3.9 from upstream would be a
+    # deliberate choice we should not silently rewrite either.
+    if "env python" not in lines[0]:
+        return new_text
+    if old_shebang == "#!/usr/bin/env python3":
+        return new_text
+    lines[0] = old_shebang
+    return "\n".join(lines)
+
+
 def _replace_running_script(path: Path, new_text: str) -> bool:
     """Atomically swap the installed script, preserving its mode bit."""
     try:
         mode = path.stat().st_mode
     except OSError:
         mode = 0o755
+    # Preserve the interpreter this install actually uses (see docstring).
+    new_text = _keep_shebang(path, new_text)
     try:
         # Write beside the target so os.replace stays on one filesystem
         # (a cross-device rename would fail); then swap atomically.
@@ -1151,6 +1187,32 @@ def _latest_pypi_version(pkg: str = "yt-dlp") -> str | None:
         return None
 
 
+def _in_venv() -> bool:
+    """True when running inside a virtualenv (sys.prefix != base prefix)."""
+    return (sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+            or bool(os.environ.get("VIRTUAL_ENV")))
+
+
+def _pep668_hint(stderr: str) -> str | None:
+    """Explain pip's externally-managed-environment refusal, if that is it.
+
+    Homebrew/Debian mark their Python as externally managed (PEP 668) and
+    refuse system-wide installs. That is a deliberate safety feature, so the
+    fix is a virtualenv or pipx — never --break-system-packages.
+    """
+    if "externally-managed-environment" not in stderr:
+        return None
+    venv_dir = Path.home() / ".local" / "share" / "ytdlmux" / "venv"
+    py = Path(sys.executable).name
+    return ("This Python is externally managed (PEP 668).\n"
+            f"       [{DIM}]Do NOT use --break-system-packages.[/]\n"
+            f"       [{DIM}]Install ytdlmux into its own venv instead:[/]\n"
+            f"       [{DIM}]  {py} -m venv {venv_dir}[/]\n"
+            f"       [{DIM}]  {venv_dir}/bin/pip install -U yt-dlp rich "
+            f"prompt_toolkit[/]\n"
+            f"       [{DIM}]  then run dl via {venv_dir}/bin/python[/]")
+
+
 def update_ytdlp() -> tuple[bool, str]:
     """Upgrade yt-dlp via pip. Returns (ok, human summary).
 
@@ -1158,12 +1220,19 @@ def update_ytdlp() -> tuple[bool, str]:
     rich TUI; we only surface a short verdict.
     """
     before = _ytdlp_version()
+    cmd = [sys.executable, "-m", "pip", "install", "-U", "--quiet", "yt-dlp"]
+    # A venv/--user target needs no special flags; a global one may be locked
+    # down by the OS, in which case pip reports it and we explain below.
+    if not _in_venv():
+        cmd.append("--user")
     try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-U", "--quiet", "yt-dlp"],
-            capture_output=True, text=True, timeout=600)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            blob = (proc.stderr or "") + (proc.stdout or "")
+            hint = _pep668_hint(blob)
+            if hint:
+                return False, hint
+            detail = blob.strip().splitlines()
             return False, detail[-1] if detail else f"pip exited {proc.returncode}"
     except Exception as exc:                                      # noqa: BLE001
         return False, str(exc)
