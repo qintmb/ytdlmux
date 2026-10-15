@@ -17,13 +17,29 @@ list. Downloads land in the folder your OS actually shows in its gallery app:
 The command is short: **`dl`**.
 
 ```
-  ⬇  ytdlmux   yt-dlp TUI downloader
-  Target   /Users/you/Movies/ytdlmux
-  Format   1080p mp4
-  Done     1 file
- ─────────────────────────────────────────────────────────────
-  ⠹ 🎬 1080p ━━━━━━━━━━━━━━━━━━━━━━━━━━━ 24.3/48.1 MB  2.1 MB/s  00:11  0:00:12
+╭──────────────────────────────────────────────────────────────╮
+│   ██╗   ██╗████████╗██████╗ ██╗     ███╗   ███╗██╗   ██╗██╗  ██╗
+│   ╚██╗ ██╔╝╚══██╔══╝██╔══██╗██║     ████╗ ████║██║   ██║╚██╗██╔╝
+│    ╚████╔╝    ██║   ██║  ██║██║     ██╔████╔██║██║   ██║ ╚███╔╝
+│     ╚██╔╝     ██║   ██║  ██║██║     ██║╚██╔╝██║██║   ██║ ██╔██╗
+│      ██║      ██║   ██████╔╝███████╗██║ ╚═╝ ██║╚██████╔╝██╔╝ ██╗
+│      ╚═╝      ╚═╝   ╚═════╝ ╚══════╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝
+│       dev by Qintomb   ·   v1.5   ·   yt-dlp TUI downloader
+│
+│   Target    /Users/you/Movies/ytdlmux
+│   Format    1080p60 mp4
+│   Done      1 file
+│   Progress  74.2%
+╰──────────────────────────────────────────────────────────────╯
+◒   TOTAL              ██████████████──────      74%  35.6/48.1 MB                       0:12
+🎬  1920x1080          ████████████────────      68%  22.4/32.9 MB  2.1 MB/s   00:11
+🎵  audio 129k         ████████████████████     100%   3.5/3.5 MB  1.7 MB/s   00:00
 ```
+
+The banner is a colour gradient, per-file rows carry a two-tone bar, speed and
+ETA, and the aggregate row shows total progress. Bars are yellow while
+transferring and green once finished, so state is readable at a glance.
+
 
 ---
 
@@ -32,7 +48,7 @@ The command is short: **`dl`**.
 | Feature | Description |
 |---|---|
 | **Interactive TUI** | Pick resolution/format from a menu instead of typing long flags |
-| **Live progress bar** | Real-time bar, speed, ETA, and elapsed time |
+| **Live progress bar** | Gradient banner, per-file two-tone bars, speed, ETA, and elapsed time |
 | **Saves to your gallery** | Writes to the OS video/DCIM folder and auto-registers with the media scanner |
 | **Best video + audio** | Automatically merges the best streams (requires `ffmpeg`) |
 | **MP3 320k audio** | Convert audio with `-a` |

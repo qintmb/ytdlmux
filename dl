@@ -36,7 +36,7 @@ from pathlib import Path
 #  version / project
 # --------------------------------------------------------------------------- #
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 GITHUB_REPO = "qintmb/ytdlmux"
 GITHUB_RAW = f"https://raw.githubusercontent.com/{GITHUB_REPO}"
@@ -248,13 +248,8 @@ try:
     from rich.text import Text
     from rich import box
     from rich.progress import (
-        BarColumn,
-        DownloadColumn,
         Progress,
         ProgressColumn,
-        SpinnerColumn,
-        TextColumn,
-        TimeElapsedColumn,
     )
 except ImportError:  # pragma: no cover
     sys.stderr.write(
@@ -288,6 +283,105 @@ class SpeedColumn(ProgressColumn):
         return Text(f"{fmt_bytes(speed)}/s", style=f"bold {WARN}")
 
 
+class SizeColumn(ProgressColumn):
+    """Bytes done / total, laid out to a fixed width and blank until known.
+
+    rich's DownloadColumn keeps the "? / ?" placeholder visible, which makes
+    the first seconds of a download look broken; a stable empty gutter reads
+    better and stops the row from jumping when the total arrives.
+    """
+
+    def render(self, task) -> Text:
+        if not task.total:
+            return Text(" " * 14)
+        total = float(task.total)
+        done = float(task.completed or 0)
+        # "68.4/71.7 MB" -- the unit is printed once, so the row stays narrow
+        # enough to keep speed and ETA on the same line at 80 columns.
+        d_str, t_str = fmt_bytes(done), fmt_bytes(total)
+        d_num = d_str.rsplit(" ", 1)[0]
+        t_num, t_unit = (t_str.rsplit(" ", 1) + [""])[:2] if " " in t_str else (t_str, "")
+        return Text(f"{d_num}/{t_num} {t_unit}".rstrip(), style=f"bold {OK}")
+
+
+class SmoothBarColumn(ProgressColumn):
+    """Width-flexible Unicode bar with semantic colour.
+
+    rich's built-in BarColumn cannot express the two-tone fill or the finished
+    state we want, so we draw it ourselves.
+    """
+
+    def __init__(self, bar_width: int = 24):
+        self.bar_width = bar_width
+        super().__init__()
+
+    def render(self, task) -> Text:
+        total = task.total
+        if not total:
+            # Unknown length: a travelling head reads as "working" far better
+            # than a row of empty cells plus "? bytes".
+            step = task.fields.get("_spin", 0) % max(self.bar_width - 6, 1)
+            bar = Text()
+            bar.append(BAR_EMPTY * step, style="grey35")
+            bar.append(BAR_FULL * 4, style=f"bold {ACCENT}")
+            bar.append(BAR_EMPTY * max(self.bar_width - step - 4, 0),
+                       style="grey35")
+            return bar
+        frac = task.completed / total if total else 0
+        finished = task.finished or frac >= 1
+        return gradient_bar(frac, self.bar_width, done=finished)
+
+
+class PercentColumn(ProgressColumn):
+    """Right-aligned percentage, blank while the total is unknown."""
+
+    def render(self, task) -> Text:
+        if not task.total:
+            frames = ("   ", "·  ", "·· ", "···")
+            step = task.fields.get("_spin", 0)
+            return Text(frames[step % len(frames)], style=DIM)
+        pct = task.completed / task.total * 100 if task.total else 0
+        return Text(f"{pct:>4.0f}%", style=f"bold {ACCENT}")
+
+
+class IconColumn(ProgressColumn):
+    """Leading icon: an animated dot for the overall row, else the kind glyph."""
+
+    def render(self, task) -> Text:
+        if task.fields.get("_overall"):
+            frames = ("◐", "◓", "◑", "◒")
+            step = task.fields.get("_spin", 0)
+            return Text(frames[step % len(frames)] + " ", style=f"bold {ACCENT}")
+        desc = task.description or ""
+        icon = desc.split(" ", 1)[0] if desc else ""
+        return Text(f"{icon} ", style=f"bold {ACCENT}")
+
+
+class LabelColumn(ProgressColumn):
+    """Download label with the icon stripped (the icon has its own column)."""
+
+    def render(self, task) -> Text:
+        desc = task.description or ""
+        if task.fields.get("_overall"):
+            return Text(f"{desc:<16}", style=f"bold {ACCENT}")
+        parts = desc.split(" ", 1)
+        name = parts[1] if len(parts) > 1 else desc
+        style = f"bold {OK}" if task.finished else "bold white"
+        return Text(f"{name:<16}", style=style)
+
+
+class SuiteTimeColumn(ProgressColumn):
+    """Elapsed time — only meaningful on the aggregate row."""
+
+    def render(self, task) -> Text:
+        if not task.fields.get("_overall"):
+            return Text("")
+        elapsed = task.elapsed
+        if elapsed is None:
+            return Text("")
+        return Text(f"  {fmt_dur(elapsed)}", style=f"bold white")
+
+
 class EtaColumn(ProgressColumn):
     """Time left reported by yt-dlp."""
 
@@ -296,8 +390,8 @@ class EtaColumn(ProgressColumn):
             return Text("")
         eta = task.fields.get("eta")
         if eta is None:
-            return Text("--:--", style=DIM)
-        return Text(fmt_eta(eta), style=f"bold {ACCENT}")
+            return Text("  --:--", style=DIM)
+        return Text(f"  {fmt_eta(eta)}", style=f"bold {ACCENT}")
 
 
 # --------------------------------------------------------------------------- #
@@ -574,6 +668,78 @@ class RichLogger:
 
 
 # --------------------------------------------------------------------------- #
+#  banner / theming
+# --------------------------------------------------------------------------- #
+
+# Plain-ASCII "YTDLMUX" wordmark. Kept as a raw string so the box-drawing
+# characters survive byte-for-byte; the width is derived rather than hardcoded
+# so edits cannot silently misalign the panel.
+BANNER = r"""██╗   ██╗████████╗██████╗ ██╗     ███╗   ███╗██╗   ██╗██╗  ██╗
+╚██╗ ██╔╝╚══██╔══╝██╔══██╗██║     ████╗ ████║██║   ██║╚██╗██╔╝
+ ╚████╔╝    ██║   ██║  ██║██║     ██╔████╔██║██║   ██║ ╚███╔╝
+  ╚██╔╝     ██║   ██║  ██║██║     ██║╚██╔╝██║██║   ██║ ██╔██╗
+   ██║      ██║   ██████╔╝███████╗██║ ╚═╝ ██║╚██████╔╝██╔╝ ██╗
+   ╚═╝      ╚═╝   ╚═════╝ ╚══════╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝"""
+
+BANNER_LINES = BANNER.split("\n")
+BANNER_WIDTH = max(len(l) for l in BANNER_LINES)
+
+# Colour ramp painted across the banner, left to right, line by line, so the
+# wordmark reads as one gradient instead of six separately-coloured rows.
+_GRADIENT = [
+    "#22d3ee", "#2dd4bf", "#34d399", "#4ade80", "#a3e635", "#facc15",
+    "#fbbf24", "#fb923c", "#f87171", "#e879f9", "#c084fc", "#a78bfa",
+]
+
+def banner_text() -> Text:
+    """The YTDLMUX wordmark as an animated-looking colour gradient."""
+    out = Text()
+    nth = 0
+    for line_i, line in enumerate(BANNER_LINES):
+        if line_i:
+            out.append("\n")
+        width = max(len(line), 1)
+        for col_i, ch in enumerate(line):
+            if ch == " ":
+                out.append(" ")
+                continue
+            # Blend the row into the ramp so wide glyphs step smoothly.
+            pos = (col_i / width + line_i / len(BANNER_LINES)) / 2
+            colour = _GRADIENT[min(int(pos * len(_GRADIENT)), len(_GRADIENT) - 1)]
+            out.append(ch, style=f"bold {colour}")
+            nth += 1
+    return out
+
+# Half-block glyphs give a smooth fill at any terminal width without needing
+# per-cell finesse; the head/tail differ so motion is visible mid-download.
+BAR_FULL = "█"
+BAR_EMPTY = "─"
+
+def gradient_bar(fraction: float, width: int = 28, done: bool = False) -> Text:
+    """A smooth Unicode progress bar with a colour that reflects state.
+
+    Colours are semantic rather than decorative: yellow while transferring,
+    green once finished, so the state is readable at a glance even on a
+    colourblind-unfriendly terminal.
+    """
+    fraction = 0.0 if fraction < 0 else (1.0 if fraction > 1 else fraction)
+    filled = int(round(fraction * width))
+    filled = min(filled, width)
+    bar = Text()
+    if done:
+        bar.append(BAR_FULL * filled, style=f"bold {OK}")
+        bar.append(BAR_EMPTY * (width - filled), style="grey35")
+    else:
+        # Two-tone fill: the leading third in the accent makes length readable
+        # without needing to count cells.
+        head = max(filled - max(width // 5, 3), 0)
+        bar.append(BAR_FULL * head, style=f"bold {ACCENT}")
+        bar.append(BAR_FULL * (filled - head), style="bold bright_cyan")
+        bar.append(BAR_EMPTY * (width - filled), style="grey35")
+    return bar
+
+
+# --------------------------------------------------------------------------- #
 #  downloader with live TUI
 # --------------------------------------------------------------------------- #
 
@@ -594,14 +760,14 @@ class Downloader:
 
     def _make_progress(self) -> Progress:
         return Progress(
-            SpinnerColumn(style=ACCENT),
-            TextColumn("[bold]{task.description}", table_column=None),
-            BarColumn(bar_width=None, complete_style=ACCENT,
-                      finished_style=OK, pulse_style=ACCENT),
-            DownloadColumn(),
+            IconColumn(),
+            LabelColumn(),
+            SmoothBarColumn(bar_width=24),
+            PercentColumn(),
+            SizeColumn(),
             SpeedColumn(),
             EtaColumn(),
-            TimeElapsedColumn(),
+            SuiteTimeColumn(),
             expand=True,
             transient=False,
             auto_refresh=False,
@@ -609,17 +775,49 @@ class Downloader:
 
     # ---------------- rendering ---------------- #
 
+    def _meta_rows(self) -> list[tuple[str, str, str]]:
+        """(label, value, value-style) shown under the banner."""
+        done = len(self.finished_files)
+        rows = [
+            ("Target", str(self.outdir), "bold white"),
+            ("Format", self.current_label or "-", f"bold {OK}"),
+            ("Done", f"{done} file" + ("s" if done != 1 else ""), "bold white"),
+        ]
+        # Surface the aggregate speed/ETA next to the metadata once we have
+        # numbers, so the headline row stays useful at a glance.
+        done_b, total_b = self._overall_totals()
+        if total_b:
+            pct = done_b / total_b * 100 if total_b else 0
+            rows.append(("Progress", f"{pct:.1f}%", f"bold {ACCENT}"))
+        return rows
+
     def header(self) -> Panel:
-        t = Text()
-        t.append("  ⬇  dl  ", style=f"bold white on {ACCENT}")
-        t.append("   yt-dlp TUI downloader\n", style=f"bold {ACCENT}")
-        t.append("  Target   ", style=DIM)
-        t.append(f"{self.outdir}\n", style="bold white")
-        t.append("  Format   ", style=DIM)
-        t.append(f"{self.current_label or '-'}\n", style=f"bold {OK}")
-        t.append("  Done     ", style=DIM)
-        t.append(f"{len(self.finished_files)} file", style="bold white")
-        return Panel(t, border_style=ACCENT, box=box.ROUNDED, padding=(0, 1))
+        body = Text()
+        # Banner width is fixed by the wordmark; centre it (and the credit
+        # line) against it so the block looks deliberate at any terminal size.
+        pad = " " * 2
+        banner = banner_text()
+        for i, line in enumerate(banner.split("\n")):
+            if i:
+                body.append("\n")
+            body.append(pad)
+            body.append_text(line)
+        body.append("\n")
+        credit = Text("dev by ", style=DIM)
+        credit.append("Qintomb", style=f"bold {ACCENT}")
+        credit.append("   ·   ", style="grey35")
+        credit.append(f"v{VERSION}", style=f"bold {WARN}")
+        credit.append("   ·   ", style="grey35")
+        credit.append("yt-dlp TUI downloader", style=DIM)
+        body.append(" " * max((BANNER_WIDTH - len(credit.plain)) // 2 + 2, 2))
+        body.append_text(credit)
+        body.append("\n\n")
+
+        width = max(len(s) for s, _, _ in self._meta_rows()) + 2
+        for label, value, vstyle in self._meta_rows():
+            body.append(f"  {label:<{width}}", style=DIM)
+            body.append(f"{value}\n", style=vstyle)
+        return Panel(body, border_style=ACCENT, box=box.ROUNDED, padding=(0, 1))
 
     def render(self):
         return Group(self.header(), self.progress.get_renderable())
@@ -658,6 +856,10 @@ class Downloader:
             key, note = self._key(d)
 
             if status == "downloading":
+                self._spin = getattr(self, "_spin", 0) + 1
+                if self.overall_id is not None:
+                    self.progress.update(self.overall_id,
+                                         _spin=self._spin, refresh=False)
                 if key not in self.tasks:
                     self.tasks[key] = self.progress.add_task(
                         f"{note}", total=None, speed=None, eta=None)
@@ -809,16 +1011,25 @@ class Downloader:
             if in_gallery:
                 media_scan(existing)
             body = Text()
-            body.append("✔  Download complete\n", style=f"bold {OK}")
-            body.append(f"   {len(files) or 1} file · {fmt_dur(elapsed)}\n", style=DIM)
+            body.append("  ✔  ", style=f"bold {OK}")
+            body.append("Download complete\n", style=f"bold {OK}")
+            body.append("     ", style="")
+            body.append(f"{len(files) or 1} file", style="bold white")
+            body.append("  ·  ", style="grey35")
+            body.append(f"{fmt_dur(elapsed)}\n", style=DIM)
+            body.append("\n")
             for f in files[-6:]:
-                body.append(f"   {Path(f).name}\n", style="white")
-            body.append(f"   → {self.outdir}\n", style=f"bold {ACCENT}")
+                body.append("     ▸ ", style=f"bold {ACCENT}")
+                body.append(f"{Path(f).name}\n", style="white")
+            body.append("\n")
+            body.append("     → ", style=DIM)
+            body.append(f"{self.outdir}\n", style=f"bold {ACCENT}")
             if in_gallery:
                 where = ("your phone's gallery" if IS_ANDROID
                          else "your video folder")
-                body.append(f"   📱 saved to {where}", style=DIM)
-            console.print(Panel(body, border_style=OK, box=box.ROUNDED))
+                body.append(f"     📱 saved to {where}", style=DIM)
+            console.print(Panel(body, border_style=OK, box=box.ROUNDED,
+                                padding=(1, 1)))
         return ok
 
 
